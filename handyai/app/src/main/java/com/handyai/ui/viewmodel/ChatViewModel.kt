@@ -64,7 +64,9 @@ class ChatViewModel(
     private val preferenceLearner: com.handyai.llm.PreferenceLearner,
     private val contextCache: com.handyai.llm.ContextCache,
     private val visionLlm: com.handyai.files.VisionLlm,
-    private val weatherService: com.handyai.net.WeatherService
+    private val weatherService: com.handyai.net.WeatherService,
+    private val onDeviceVision: com.handyai.files.OnDeviceVisionAnalyzer,
+    private val proceduralArt: com.handyai.llm.ProceduralArtEngine
 ) : ViewModel() {
 
     val messages: StateFlow<List<Message>> = chatRepo.observeMessages(chatId)
@@ -1163,14 +1165,29 @@ class ChatViewModel(
      */
     private suspend fun tryVisionLlm(imageUri: Uri, question: String): String? {
         return try {
-            _statusText.value = "Asking vision model… (cloud, 5–30 seconds)"
             val savedId = settings.activeVisionModelId.first()
-            val preferredCloudId = savedId?.let { id ->
-                com.handyai.llm.ModelCatalog.byId(id)?.takeIf {
-                    it.modelType == com.handyai.llm.ModelType.VISION
-                }?.cloudModelId
+
+            // ── v1.4.9: ON-DEVICE VISION ROUTING ──────────────────────
+            // If the active vision model id has the on-device prefix,
+            // route to OnDeviceVisionAnalyzer (ML Kit — no network, instant).
+            // Otherwise, route to the cloud VLM (VisionLlm) as before.
+            if (savedId != null &&
+                savedId.startsWith(com.handyai.files.OnDeviceVisionAnalyzer.ID_PREFIX)
+            ) {
+                _statusText.value = "Analyzing image on-device (ML Kit)…"
+                android.util.Log.i("HandyAi/ChatVM",
+                    "Routing vision query to OnDeviceVisionAnalyzer (id=$savedId)")
+                val result = onDeviceVision.ask(imageUri, question)
+                result
+            } else {
+                _statusText.value = "Asking vision model… (cloud, 5–30 seconds)"
+                val preferredCloudId = savedId?.let { id ->
+                    com.handyai.llm.ModelCatalog.byId(id)?.takeIf {
+                        it.modelType == com.handyai.llm.ModelType.VISION
+                    }?.cloudModelId
+                }
+                visionLlm.ask(imageUri, question, preferredCloudId)
             }
-            visionLlm.ask(imageUri, question, preferredCloudId)
         } catch (t: Throwable) {
             android.util.Log.w("HandyAi/ChatVM", "tryVisionLlm failed: ${t.message}")
             null
@@ -1205,21 +1222,36 @@ class ChatViewModel(
             chatRepo.rename(chatId, newTitle)
         }
 
-        // 3) Image gen is always available (cloud-based via Pollinations.ai).
-        //    isModelLoaded() returns true by default — no model loading needed.
-
         // v1.4.7: Parse --turbo / --wide / --size etc. flags out of the
         // prompt before sending to Pollinations. Flags are stripped from
         // the visible prompt so the bubble caption shows just the prompt.
         val (cleanPrompt, opts) = com.handyai.llm.ImageGenOptions.parse(prompt)
         val effectivePrompt = cleanPrompt.ifBlank { prompt }
 
-        // 4) Generate
-        val sizeNote = if (opts.width != 512 || opts.height != 512) " (${opts.width}x${opts.height})" else ""
-        _statusText.value = "Generating image via Pollinations.ai [${opts.model}]$sizeNote… (5–15 seconds)"
+        // ── v1.4.9: ON-DEVICE IMAGE GEN ROUTING ───────────────────────
+        // If the active image-gen model id starts with the on-device prefix,
+        // route to ProceduralArtEngine (instant, no network). Otherwise,
+        // route to the cloud ImageGenEngine (Pollinations) as before.
+        val activeImgGenId = settings.activeImgGenModelId.first()
+        val useOnDeviceImgGen = activeImgGenId != null &&
+            activeImgGenId.startsWith(com.handyai.llm.ProceduralArtEngine.ID_PREFIX)
+
         _streamingChunk.value = ""
         try {
-            val result = imageGen.generateWithOptions(effectivePrompt, opts)
+            val result = if (useOnDeviceImgGen) {
+                val sizeNote = if (opts.width != 512 || opts.height != 512) " (${opts.width}x${opts.height})" else ""
+                _statusText.value = "Generating abstract art on-device$sizeNote… (instant)"
+                android.util.Log.i("HandyAi/ChatVM",
+                    "Routing /draw to ProceduralArtEngine (id=$activeImgGenId)")
+                // Per-draw flags like --turbo / --realism are ignored for
+                // procedural art (there's only one generator). Custom
+                // dimensions ARE honored.
+                proceduralArt.generate(effectivePrompt, opts.width, opts.height)
+            } else {
+                val sizeNote = if (opts.width != 512 || opts.height != 512) " (${opts.width}x${opts.height})" else ""
+                _statusText.value = "Generating image via Pollinations.ai [${opts.model}]$sizeNote… (5–15 seconds)"
+                imageGen.generateWithOptions(effectivePrompt, opts)
+            }
             result.onSuccess { imagePath ->
                 // 5) Persist assistant message with the image
                 chatRepo.appendMessage(
@@ -1425,11 +1457,13 @@ class ChatViewModelFactory(
     private val preferenceLearner: com.handyai.llm.PreferenceLearner,
     private val contextCache: com.handyai.llm.ContextCache,
     private val visionLlm: com.handyai.files.VisionLlm,
-    private val weatherService: com.handyai.net.WeatherService
+    private val weatherService: com.handyai.net.WeatherService,
+    private val onDeviceVision: com.handyai.files.OnDeviceVisionAnalyzer,
+    private val proceduralArt: com.handyai.llm.ProceduralArtEngine
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache, visionLlm, weatherService) as T
+        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache, visionLlm, weatherService, onDeviceVision, proceduralArt) as T
 }
 
 /**

@@ -57,6 +57,18 @@ class HandyAiApp : Application() {
      *  id is read from settings by ChatViewModel and passed through to
      *  VisionLlm.ask(). */
     val visionLlm by lazy { com.handyai.files.VisionLlm(this) }
+
+    /** v1.4.9: Lightweight ON-DEVICE vision analyzer using ML Kit.
+     *  No model download — uses models bundled via Google Play services.
+     *  ChatViewModel routes here when the active vision model id starts
+     *  with "ondevice-vision-" (see OnDeviceVisionAnalyzer.ID_PREFIX). */
+    val onDeviceVision by lazy { com.handyai.files.OnDeviceVisionAnalyzer(this) }
+
+    /** v1.4.9: Lightweight ON-DEVICE image generator (procedural art).
+     *  No model download — generates abstract art deterministically from
+     *  prompt hash. ChatViewModel routes /draw here when the active
+     *  image-gen model id starts with "ondevice-imggen-". */
+    val proceduralArt by lazy { com.handyai.llm.ProceduralArtEngine(this) }
     /** Map-reduce summarization pipeline for large attached documents.
      *  Uses [llmEngine] under the hood but with tiny focused prompts
      *  that even 0.5B models can handle reliably. */

@@ -73,27 +73,32 @@ class ModelSettingsViewModel(
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), CombinedEngineState.Idle)
 
     fun isDownloaded(spec: ModelSpec): Boolean = when (spec.modelType) {
-        // Cloud models — never "downloaded" in the file sense. They're
-        // always available (given internet), so report true so the UI
-        // shows the "Activate" button instead of the "Download" button.
-        ModelType.VISION, ModelType.IMAGE_GEN -> true
+        // Cloud + on-device-bundled models — never "downloaded" in the file sense.
+        // They're always available, so report true so the UI shows the "Activate"
+        // button instead of the "Download" button.
+        ModelType.VISION, ModelType.IMAGE_GEN,
+        ModelType.ON_DEVICE_VISION, ModelType.ON_DEVICE_IMAGE_GEN -> true
         ModelType.LLM -> downloader.isDownloaded(spec)
     }
 
     fun download(spec: ModelSpec) = viewModelScope.launch {
-        // Cloud models have nothing to download. Guard against the UI
-        // accidentally invoking this (it shouldn't, but be safe).
+        // Cloud + on-device-bundled models have nothing to download.
+        // Only LLM (.task file) actually downloads.
         if (spec.modelType != ModelType.LLM) return@launch
         downloader.download(spec)
     }
 
     fun activate(spec: ModelSpec) = viewModelScope.launch {
         // ── DISPATCH BY MODEL TYPE ────────────────────────────────────
-        // v1.4.7: Three model types now:
-        //   - LLM       → on-device .task file, requires prior download
-        //   - VISION    → cloud VLM, no download, persist selection in settings
-        //   - IMAGE_GEN → cloud Pollinations, no download, persist selection
-        //                 + apply to ImageGenEngine immediately
+        // v1.4.9: Five model types now:
+        //   - LLM                 → on-device .task file, requires prior download
+        //   - VISION              → cloud VLM, no download, persist selection in settings
+        //   - IMAGE_GEN           → cloud Pollinations, no download, persist selection
+        //                          + apply to ImageGenEngine immediately
+        //   - ON_DEVICE_VISION    → ML Kit-based, no download, persist selection
+        //                          (ChatViewModel routes to OnDeviceVisionAnalyzer)
+        //   - ON_DEVICE_IMAGE_GEN → procedural, no download, persist selection
+        //                          (ChatViewModel routes to ProceduralArtEngine)
         try {
             when (spec.modelType) {
                 ModelType.LLM -> {
@@ -109,20 +114,24 @@ class ModelSettingsViewModel(
                         settings.setActiveModel(path, spec.displayName)
                     }
                 }
-                ModelType.VISION -> {
-                    // Cloud VLM — no engine state to flip. Persist the
-                    // selection; ChatViewModel reads it when an image is
-                    // attached and passes the model id to VisionLlm.ask().
+                ModelType.VISION, ModelType.ON_DEVICE_VISION -> {
+                    // Cloud OR on-device vision — both persist selection in
+                    // settings. ChatViewModel reads activeVisionModelId and
+                    // routes to VisionLlm (cloud) or OnDeviceVisionAnalyzer
+                    // (on-device) based on the id prefix.
                     settings.setActiveVisionModel(spec.id)
                     android.util.Log.i("HandyAi/ModelSettingsVM",
                         "Active vision model set to ${spec.id} (${spec.cloudModelId})")
                 }
-                ModelType.IMAGE_GEN -> {
-                    // Cloud image gen — persist the selection AND push the
-                    // Pollinations model id to the engine immediately so
-                    // the next /draw uses it (no app restart needed).
+                ModelType.IMAGE_GEN, ModelType.ON_DEVICE_IMAGE_GEN -> {
+                    // Cloud OR on-device image gen — both persist selection.
+                    // For cloud models, also push the Pollinations model id
+                    // to the engine immediately. For on-device procedural,
+                    // the id prefix tells ChatViewModel to use ProceduralArtEngine.
                     settings.setActiveImgGenModel(spec.id)
-                    imageGen.setActiveModelId(spec.cloudModelId)
+                    if (spec.modelType == ModelType.IMAGE_GEN) {
+                        imageGen.setActiveModelId(spec.cloudModelId)
+                    }
                     android.util.Log.i("HandyAi/ModelSettingsVM",
                         "Active image-gen model set to ${spec.id} (${spec.cloudModelId})")
                 }
@@ -151,10 +160,10 @@ class ModelSettingsViewModel(
     }
 
     /**
-     * v1.4.7: Unload one specific model. For cloud models (VISION /
-     * IMAGE_GEN), "unload" means "clear the user's selection" — there's
-     * no engine state to clear. For LLM, it calls llm.unload() AND
-     * deletes the file.
+     * v1.4.7 / v1.4.9: Unload one specific model. For cloud OR on-device-bundled
+     * models (VISION / IMAGE_GEN / ON_DEVICE_VISION / ON_DEVICE_IMAGE_GEN),
+     * "unload" means "clear the user's selection" — there's no engine state
+     * to clear. For LLM, it calls llm.unload() AND deletes the file.
      */
     fun delete(spec: ModelSpec) = viewModelScope.launch {
         when (spec.modelType) {
@@ -167,13 +176,13 @@ class ModelSettingsViewModel(
                 downloader.localPath(spec).delete()
                 downloader.reset(spec.id)
             }
-            ModelType.VISION -> {
+            ModelType.VISION, ModelType.ON_DEVICE_VISION -> {
                 val currentId = settings.activeVisionModelId.firstOrNull()
                 if (currentId == spec.id) {
                     settings.setActiveVisionModel(null)
                 }
             }
-            ModelType.IMAGE_GEN -> {
+            ModelType.IMAGE_GEN, ModelType.ON_DEVICE_IMAGE_GEN -> {
                 val currentId = settings.activeImgGenModelId.firstOrNull()
                 if (currentId == spec.id) {
                     settings.setActiveImgGenModel(null)

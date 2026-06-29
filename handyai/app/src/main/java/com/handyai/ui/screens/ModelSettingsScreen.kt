@@ -210,6 +210,44 @@ fun ModelsPanel(onClose: (() -> Unit)? = null) {
                 )
             }
 
+            // ── SECTION 4: ON-DEVICE VISION (v1.4.9) ───────────────────
+            SectionHeader(
+                title = "Vision models (on-device)",
+                subtitle = "Fully offline vision via ML Kit (OCR + object detection + image labeling). No download — uses models already on the device from Google Play services. Instant (100-500ms), private. Limited to scene description; for nuanced questions use a cloud VLM above."
+            )
+            ModelCatalog.ON_DEVICE_VISION_MODELS.forEach { spec ->
+                ModelCard(
+                    spec = spec,
+                    isActive = activeVisionId == spec.id,
+                    downloadState = DownloadState.Idle,
+                    isDownloaded = vm.isDownloaded(spec),
+                    combinedState = combinedState,
+                    onDownload = { /* bundled — no download */ },
+                    onActivate = { scope.launch { vm.activate(spec) } },
+                    onUnload = { scope.launch { vm.delete(spec) } },
+                    onDelete = { scope.launch { vm.delete(spec) } }
+                )
+            }
+
+            // ── SECTION 5: ON-DEVICE IMAGE GENERATION (v1.4.9) ─────────
+            SectionHeader(
+                title = "Image generation models (on-device)",
+                subtitle = "Procedural art generator — no model download, no internet needed. Generates abstract art deterministically from your prompt's keywords (sunset, ocean, neon, forest, fire, etc.). Same prompt always produces the same image. Output is abstract art, not photorealistic — for representational images, switch to a cloud model above."
+            )
+            ModelCatalog.ON_DEVICE_IMAGE_GEN_MODELS.forEach { spec ->
+                ModelCard(
+                    spec = spec,
+                    isActive = activeImgGenId == spec.id,
+                    downloadState = DownloadState.Idle,
+                    isDownloaded = vm.isDownloaded(spec),
+                    combinedState = combinedState,
+                    onDownload = { /* bundled — no download */ },
+                    onActivate = { scope.launch { vm.activate(spec) } },
+                    onUnload = { scope.launch { vm.delete(spec) } },
+                    onDelete = { scope.launch { vm.delete(spec) } }
+                )
+            }
+
             Spacer(Modifier.height(16.dp))
             ImageGenTestCard()
             Spacer(Modifier.height(8.dp))
@@ -437,6 +475,8 @@ private fun ModelCard(
                                 ModelType.VISION -> "Set as vision model"
                                 ModelType.IMAGE_GEN -> "Set as image generator"
                                 ModelType.LLM -> "Load model"
+                                ModelType.ON_DEVICE_VISION -> "Set as on-device vision"
+                                ModelType.ON_DEVICE_IMAGE_GEN -> "Set as on-device generator"
                             }
                         )
                     }

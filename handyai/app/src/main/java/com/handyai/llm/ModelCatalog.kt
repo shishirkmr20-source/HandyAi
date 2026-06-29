@@ -19,16 +19,31 @@ package com.handyai.llm
 /**
  * Pre-configured models available in the Models page.
  *
- * Three categories:
+ * Five categories:
  *
- *   1. LLM         → on-device text generation (MediaPipe .task file)
- *                    Downloaded once, runs fully offline.
- *   2. VISION      → cloud multimodal vision-language model (HF Inference API).
- *                    No download; activated instantly; used when user asks
- *                    a question about an attached image.
- *   3. IMAGE_GEN   → cloud text-to-image (Pollinations.ai).
- *                    No download; activated instantly; invoked from chat
- *                    via "/draw <prompt>" or "/image <prompt>".
+ *   1. LLM                → on-device text generation (MediaPipe .task file)
+ *                           Downloaded once, runs fully offline.
+ *   2. VISION             → cloud multimodal vision-language model (HF Inference API).
+ *                           No download; activated instantly; used when user asks
+ *                           a question about an attached image.
+ *   3. IMAGE_GEN          → cloud text-to-image (Pollinations.ai).
+ *                           No download; activated instantly; invoked from chat
+ *                           via "/draw <prompt>" or "/image <prompt>".
+ *   4. ON_DEVICE_VISION   → on-device vision (ML Kit — OCR + object detection +
+ *                           image labeling). No download, runs fully offline,
+ *                           instant. Limited to scene description; can't answer
+ *                           nuanced questions. Use when no internet or for
+ *                           privacy. (v1.4.9)
+ *   5. ON_DEVICE_IMAGE_GEN→ on-device procedural art generator (no model download).
+ *                           Produces abstract art from text prompts deterministically.
+ *                           Not photorealistic. Use when no internet or for
+ *                           instant results. (v1.4.9)
+ *
+ * v1.4.9: ON_DEVICE_VISION + ON_DEVICE_IMAGE_GEN categories added. The user
+ *   asked for lightweight on-device options to complement the cloud ones —
+ *   ML Kit (vision) and procedural generation (image gen) are the two
+ *   realistic lightweight options that work without a multi-hundred-MB
+ *   model file download.
  *
  * v1.4.7: VISION category added. Previously vision was an invisible cloud
  *   pipeline (BLIP caption + OCR) with no model picker. Users can now
@@ -42,7 +57,7 @@ package com.handyai.llm
  * v1.4.5: SmolLM 135M + FastVLM-0.5B (.litertlm) entries REMOVED.
  *   SmolLM produced low-quality output; FastVLM crashed natively.
  */
-enum class ModelType { LLM, VISION, IMAGE_GEN }
+enum class ModelType { LLM, VISION, IMAGE_GEN, ON_DEVICE_VISION, ON_DEVICE_IMAGE_GEN }
 
 /**
  * @param cloudModelId  For VISION/IMAGE_GEN cloud models: the upstream
@@ -220,6 +235,54 @@ object ModelCatalog {
             paramCountB = 12.0,
             modelType = ModelType.IMAGE_GEN,
             cloudModelId = "flux-3d"
+        ),
+
+        // ─── ON-DEVICE VISION (v1.4.9) ───────────────────────────────────
+        // Lightweight, fully-offline vision using ML Kit. No model file
+        // download — ML Kit ships its models via Google Play services and
+        // shares them across all ML Kit apps on the device. Produces a
+        // structured scene description (objects + labels + OCR text) that
+        // answers "what's in this image" directly. For nuanced questions
+        // ("what's the mood of this scene?"), users should switch to a
+        // cloud VLM (Llama-3.2-Vision) on the Models page.
+        ModelSpec(
+            id = "ondevice-vision-mlkit",
+            displayName = "Scene Analyzer (ML Kit)",
+            description = "Fully on-device vision via ML Kit (OCR + object detection + " +
+                "image labeling). No download — uses models already on the device from " +
+                "Google Play services. Instant (100-500ms), works offline, private. " +
+                "Best for 'what's in this image', 'read the text', 'how many objects'. " +
+                "Cannot interpret mood/actions — switch to a cloud VLM for that.",
+            downloadUrl = "",
+            sizeMb = 0,
+            ramMb = 0,
+            paramCountB = 0.0,
+            recommended = true,
+            modelType = ModelType.ON_DEVICE_VISION,
+            cloudModelId = "mlkit-bundled"
+        ),
+
+        // ─── ON-DEVICE IMAGE GENERATION (v1.4.9) ─────────────────────────
+        // Procedural art generator — no model file, no download, instant.
+        // Produces abstract art deterministically from the prompt's hash.
+        // Same prompt → same image. Good for avatars, backgrounds, abstract
+        // pieces. NOT photorealistic — for "a cat on a chair" type prompts,
+        // users should switch to cloud Flux on the Models page.
+        ModelSpec(
+            id = "ondevice-imggen-procedural",
+            displayName = "Procedural Art (on-device)",
+            description = "Instant on-device abstract art generator. No model download, " +
+                "no internet needed. Picks colors and patterns from prompt keywords " +
+                "(sunset, ocean, neon, forest, fire, etc.). Same prompt always " +
+                "produces the same image. Output is abstract art, not photorealistic. " +
+                "Best for backgrounds, avatars, mood pieces.",
+            downloadUrl = "",
+            sizeMb = 0,
+            ramMb = 0,
+            paramCountB = 0.0,
+            recommended = true,
+            modelType = ModelType.ON_DEVICE_IMAGE_GEN,
+            cloudModelId = "procedural"
         )
     )
 
@@ -231,6 +294,12 @@ object ModelCatalog {
 
     /** All cloud image-generation models. */
     val IMAGE_GEN_MODELS: List<ModelSpec> = ALL.filter { it.modelType == ModelType.IMAGE_GEN }
+
+    /** v1.4.9: All on-device vision models (ML Kit-based). */
+    val ON_DEVICE_VISION_MODELS: List<ModelSpec> = ALL.filter { it.modelType == ModelType.ON_DEVICE_VISION }
+
+    /** v1.4.9: All on-device image-generation models (procedural). */
+    val ON_DEVICE_IMAGE_GEN_MODELS: List<ModelSpec> = ALL.filter { it.modelType == ModelType.ON_DEVICE_IMAGE_GEN }
 
     fun byId(id: String): ModelSpec? = ALL.firstOrNull { it.id == id }
 }

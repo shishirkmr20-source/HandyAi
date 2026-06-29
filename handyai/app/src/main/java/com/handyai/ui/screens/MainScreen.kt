@@ -609,7 +609,9 @@ private fun ChatPane(
             preferenceLearner = app.preferenceLearner,
             contextCache = app.contextCache,
             visionLlm = app.visionLlm,
-            weatherService = app.weatherService
+            weatherService = app.weatherService,
+            onDeviceVision = app.onDeviceVision,
+            proceduralArt = app.proceduralArt
         )
     )
 
