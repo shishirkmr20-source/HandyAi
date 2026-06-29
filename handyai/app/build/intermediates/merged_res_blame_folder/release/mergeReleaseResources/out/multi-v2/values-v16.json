@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.handyai.app-mergeReleaseResources-63:/values-v16/values-v16.xml",
+            "map": [
+                {
+                    "source": "/home/z/.gradle/caches/8.10.2/transforms/fb1efd730249d50c6a727028100ee5b4/transformed/appcompat-1.6.1/res/values-v16/values-v16.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endLines": "5",
+                        "endColumns": "12",
+                        "endOffsets": "223"
+                    }
+                }
+            ]
+        }
+    ]
+}
