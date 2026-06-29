@@ -81,27 +81,38 @@ fun JournalScreen(onBack: () -> Unit) {
             )
         },
         floatingActionButton = {
-            // Prominent "Add" FAB — parity with the Habits screen.
-            // Uses the same gradient as the chat Send button so the
-            // "create" action feels consistent across the app.
-            val palette = handyAiPalette()
-            Box(
-                modifier = Modifier
-                    .size(56.dp)
-                    .clip(CircleShape)
-                    .background(
-                        Brush.horizontalGradient(
-                            listOf(palette.indigo, palette.lavender)
+            // ── HIDE FAB WHEN EDITOR IS OPEN ─────────────────────────────
+            // Previous bug: the FAB stayed visible even when the JournalEditor
+            // was open. The user would fill in title/content/mood, then see
+            // the floating "+" icon in the corner and tap it expecting
+            // "save" — but the FAB's onClick just re-set `creating = true`
+            // (a no-op) and the entry was NEVER saved. The actual Save
+            // button is the full-width gradient button at the BOTTOM of the
+            // JournalEditor (its own Scaffold's bottomBar).
+            //
+            // Fix: only show the FAB when we're displaying the list. When
+            // the editor is open, the FAB is hidden so there's no
+            // competing "plus" affordance to confuse the user.
+            if (creating.not() && editing == null) {
+                val palette = handyAiPalette()
+                Box(
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(palette.indigo, palette.lavender)
+                            )
                         )
+                        .clickable { creating = true; editing = null },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.Add, "New entry",
+                        tint = Color.White,
+                        modifier = Modifier.size(28.dp)
                     )
-                    .clickable { creating = true; editing = null },
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.Add, "New entry",
-                    tint = Color.White,
-                    modifier = Modifier.size(28.dp)
-                )
+                }
             }
         }
     ) { padding ->

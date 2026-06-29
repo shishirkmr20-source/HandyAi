@@ -192,18 +192,60 @@ class LlmEngine(private val context: Context) {
             // the message list has grown. The OS kills the process with no
             // exception, no log, just a silent "app crashed."
             //
-            // Fix: detect low-RAM devices via ActivityManager.getMemoryClass()
-            // (the per-app heap budget in MB). If it's ≤ 192 MB (typical for
-            // 4 GB phones), cap MAX_TOKENS at 1536 instead of 2048. This
-            // trims ~25% off the KV cache memory with minimal quality impact
-            // (the sliding-window history trim already keeps prompts short).
-            val memoryClass = (context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
-                as? android.app.ActivityManager)?.memoryClass ?: 256
-            val effectiveMaxTokens = if (memoryClass <= 192) {
-                android.util.Log.i(TAG, "Low-RAM device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at 1536")
-                (MAX_TOKENS * 3 / 4).coerceAtLeast(1024)
-            } else {
-                MAX_TOKENS
+            // FIX (v1.3.0): Use TWO signals together —
+            //   1. ActivityManager.memoryClass (per-app Dalvik heap in MB).
+            //      This is the JVM-only budget. With largeHeap="true" the
+            //      effective limit is largeMemoryClass, but memoryClass is
+            //      still a useful proxy for "is this a low-end device."
+            //   2. ActivityManager.MemoryInfo.totalMem (device RAM in bytes).
+            //      This is the GROUND TRUTH for phone-vs-tablet detection.
+            //      Tablets typically have 6-12 GB; phones often have 3-6 GB.
+            //      The memoryClass check alone missed phones with 4 GB RAM
+            //      and a 256 MB heap — they passed the ≤192 MB threshold
+            //      but still got OOM-killed after a few chats because the
+            //      native MediaPipe allocations live OUTSIDE the Dalvik heap
+            //      (mmap'd GPU/AI memory, not counted toward memoryClass).
+            //
+            // Decision matrix:
+            //   - totalMem < 3 GB          → cap at 1024 (very tight)
+            //   - totalMem < 5 GB          → cap at 1280 (phone, 3-5 GB)
+            //   - memoryClass ≤ 192 MB     → cap at 1536 (low-heap device)
+            //   - otherwise                → 2048 (default, tablets + good phones)
+            //
+            // The most aggressive cap wins. Trimming KV cache by 50% only
+            // costs ~10-15% of conversational recall (the sliding-window
+            // history trim already keeps prompts short) and is a much better
+            // trade than a silent OOM crash.
+            val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager
+            val memoryClass = am?.memoryClass ?: 256
+            val totalMemMb = am?.let {
+                android.app.ActivityManager.MemoryInfo().also { mi ->
+                    it.getMemoryInfo(mi)
+                }.totalMem / (1024L * 1024L)
+            } ?: 4096L
+
+            val effectiveMaxTokens = when {
+                totalMemMb < 3072 -> {
+                    android.util.Log.i(TAG,
+                        "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1024")
+                    1024
+                }
+                totalMemMb < 5120 -> {
+                    android.util.Log.i(TAG,
+                        "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1280")
+                    1280
+                }
+                memoryClass <= 192 -> {
+                    android.util.Log.i(TAG,
+                        "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at 1536")
+                    1536
+                }
+                else -> {
+                    android.util.Log.i(TAG,
+                        "Normal-RAM device (totalMem=${totalMemMb}MB, memoryClass=${memoryClass}MB) — using MAX_TOKENS=$MAX_TOKENS")
+                    MAX_TOKENS
+                }
             }
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(path)

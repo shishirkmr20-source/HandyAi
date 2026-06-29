@@ -32,6 +32,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -177,6 +179,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
 
+            Spacer(Modifier.height(8.dp))
+
+            // Section: Diagnostics
+            SectionHeader("Diagnostics")
+            CrashLogCard()
+
             Spacer(Modifier.height(24.dp))
             Text(
                 "HandyAi is open-source software. No accounts, No analytics.",
@@ -221,6 +229,136 @@ private fun SwitchRow(
             }
             Spacer(Modifier.width(8.dp))
             Switch(checked = checked, onCheckedChange = onToggle)
+        }
+    }
+}
+
+/**
+ * Crash log viewer card.
+ *
+ * Shows the most recent JVM-level crash captured by [com.handyai.CrashLogger].
+ * If no crash has been recorded, shows a reassuring "No crashes recorded"
+ * message. If a crash log exists, shows:
+ *   - A header with a warning icon + "Crash log found"
+ *   - The first ~30 lines of the crash report in a monospace scrollable box
+ *   - Two buttons: "Share" (opens Android share sheet with full log text)
+ *   - and "Clear" (deletes the log file)
+ *
+ * WHY THIS EXISTS
+ * ───────────────
+ * The user reported the app "crashes after a few chats" on their phone but
+ * works fine on their tablet. Without a crash log, we can only guess at the
+ * cause (OOM? native fault? race condition?). This card lets the user
+ * capture + share the JVM-level stack trace so we can diagnose remotely.
+ *
+ * If the app crashes NATIVELY (SIGSEGV from MediaPipe), this handler will
+ * NOT fire — the lack of a log entry after a crash is itself a signal that
+ * the crash was native (likely OOM-kill or a MediaPipe fault).
+ */
+@Composable
+private fun CrashLogCard() {
+    val context = LocalContext.current
+    var logText by remember { mutableStateOf<String?>(null) }
+    var showFullLog by remember { mutableStateOf(false) }
+
+    // Refresh the log every time this composable enters composition.
+    // We can't use a Flow here because CrashLogger writes to a plain file.
+    LaunchedEffect(Unit) {
+        logText = com.handyai.CrashLogger.readCurrentLog(context)
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    if (logText != null) Icons.Default.Warning else Icons.Default.CheckCircle,
+                    null,
+                    tint = if (logText != null) MaterialTheme.colorScheme.error
+                           else MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    if (logText != null) "Crash log found" else "No crashes recorded",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            if (logText == null) {
+                Text(
+                    "If HandyAi ever crashes unexpectedly, a detailed report " +
+                        "(with stack trace, device info, and memory status) will " +
+                        "appear here so you can share it back for diagnosis.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                Text(
+                    "The most recent JVM-level crash was captured. Tap Share to " +
+                        "send the full report to the developer. Note: if the app " +
+                        "crashed but NO log appears here, the crash was likely " +
+                        "native (memory pressure / MediaPipe fault) — restart the " +
+                        "app and try a smaller model.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(12.dp))
+                // Preview of the crash log (first ~30 lines or full if expanded)
+                val preview = if (showFullLog) logText!!
+                              else logText!!.lines().take(30).joinToString("\n")
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        preview,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier
+                            .padding(12.dp)
+                            .heightIn(max = 280.dp)
+                            .verticalScroll(rememberScrollState())
+                    )
+                }
+                if (logText!!.lines().size > 30) {
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(onClick = { showFullLog = !showFullLog }) {
+                        Text(if (showFullLog) "Show less" else "Show full log " +
+                            "(${logText!!.lines().size} lines)")
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(android.content.Intent.EXTRA_SUBJECT,
+                                    "HandyAi crash report")
+                                putExtra(android.content.Intent.EXTRA_TEXT,
+                                    logText ?: "")
+                            }
+                            context.startActivity(android.content.Intent.createChooser(intent,
+                                "Share crash log"))
+                        }
+                    ) {
+                        Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Share")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            com.handyai.CrashLogger.clearCurrentLog(context)
+                            logText = null
+                            showFullLog = false
+                        }
+                    ) {
+                        Icon(Icons.Default.Delete, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Clear")
+                    }
+                }
+            }
         }
     }
 }

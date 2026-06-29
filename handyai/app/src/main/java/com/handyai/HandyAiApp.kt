@@ -71,6 +71,13 @@ class HandyAiApp : Application() {
         instance = this
         com.handyai.ui.viewmodel.HandyAiAppResolver.resolver = contentResolver
 
+        // Install the global crash logger FIRST, before any other code runs.
+        // This captures JVM-level crashes (OOM, NPE, etc.) to a file in the
+        // app's internal storage so the user can view + share it from
+        // Settings → "Crash log". Native crashes (SIGSEGV) bypass this —
+        // see CrashLogger.kt docs for why and what that means for diagnosis.
+        com.handyai.CrashLogger.install(this)
+
         // PDFBox-android requires a one-time init before any PDDocument.load()
         // call. Without this, every PDF parse silently fails with an exception
         // that FileTextExtractor catches and returns as "[PDF parse error: ...]".
