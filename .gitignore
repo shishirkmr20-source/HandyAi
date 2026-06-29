@@ -6,3 +6,4 @@ download/*.zip
 download/*-apk-extract/
 download/*.apk
 tool-results/
+download/
