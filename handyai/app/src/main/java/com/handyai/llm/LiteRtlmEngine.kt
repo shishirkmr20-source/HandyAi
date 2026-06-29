@@ -23,7 +23,6 @@ import android.net.Uri
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
-import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
@@ -42,52 +41,57 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
- * Wraps Google's LiteRT-LM runtime — the *other* on-device LLM engine
- * alongside MediaPipe. LiteRT-LM is the only way to run `.litertlm` model
- * files, which is the format HuggingFace's `litert-community` ships
+ * Wraps Google's LiteRT-LM runtime (alpha05) — the *other* on-device LLM
+ * engine alongside MediaPipe. LiteRT-LM is the only way to run `.litertlm`
+ * model files, which is the format HuggingFace's `litert-community` ships
  * vision-language models in (e.g. Apple FastVLM-0.5B).
- *
- * WHY THIS EXISTS (v1.4.0)
- * ────────────────────────
- * MediaPipe's `LlmInference` API only accepts `.task` files and only does
- * text generation. It cannot run vision-language models. When the user
- * asked for "a vision model from HuggingFace which doesn't require
- * authentication to download, similar to what we can download for other
- * LLMs", the natural fit was `litert-community/FastVLM-0.5B` — a true
- * multimodal VLM from Apple, hosted as a `.litertlm` file (no auth, free
- * download). The catch: we need LiteRT-LM to run it.
- *
- * So this class is the LiteRT-LM counterpart to [LlmEngine] (which wraps
- * MediaPipe). They have parallel surface areas:
  *
  *   - [LlmEngine]       → MediaPipe  → `.task` files    → text-only
  *   - [LiteRtlmEngine]  → LiteRT-LM  → `.litertlm`      → text + vision
+ *
+ * The ChatViewModel dispatches to whichever engine matches the active
+ * model's file extension.
  *
  * NATIVE VISION (no OCR/labels needed)
  * ────────────────────────────────────
  * When FastVLM is active, image attachments are passed DIRECTLY to the
  * model as `Content.ImageBytes` — no ML Kit OCR, no image labeling, no
- * "describe what the labels mean" hallucination. The model's vision
- * encoder reads the pixels and produces a real natural-language answer.
+ * cloud BLIP. The model's vision encoder reads the pixels and produces
+ * a real natural-language answer.
  *
  * KV CACHE (PocketPal-style instant replies)
  * ──────────────────────────────────────────
  * LiteRT-LM maintains the KV cache inside its `Conversation` object
  * automatically. We keep a single long-lived conversation for the
  * lifetime of the loaded model, so each new user message only pays
- * the prefill cost for the NEW tokens — not the whole history. This
- * is the same trick PocketPal AI uses.
+ * the prefill cost for the NEW tokens — not the whole history.
  *
  * SYNC API (v1.4.0 limitation)
  * ────────────────────────────
- * LiteRT-LM alpha05 has an async `sendMessageAsync` Flow API and a
- * callback variant. For reliability we use the SYNC `sendMessage(message)`
- * API which blocks until the full response is ready, then returns the
- * complete Message. The user sees a "Vision model analyzing image…"
- * status during generation, then the reply appears word-by-word via
- * a brief fake-typing effect on the final text.
+ * LiteRT-LM alpha05 has an async `sendMessageAsync(message, callback)`
+ * API but its completion semantics are unclear (the callback has
+ * onMessage + onError but no documented "done" signal). For reliability
+ * we use the SYNC `sendMessage(message)` API which blocks until the
+ * full response is ready. 60-second hard timeout.
  *
- * 60-second hard timeout — if the model hangs, we abort.
+ * After the sync call returns, we emit the response word-by-word via
+ * [onChunk] to give a typing effect.
+ *
+ * ALPHA05 API NOTES
+ * ──────────────────
+ * The alpha05 AAR has a DIFFERENT API than the current `main` branch
+ * of LiteRT-LM. Specifically:
+ *   - `Backend` is an ENUM (Backend.CPU / Backend.GPU / Backend.NPU),
+ *     NOT a sealed class with CPU()/GPU() instances.
+ *   - `ConversationConfig` takes `systemMessage: Message?` (not
+ *     `systemInstruction: Contents?`). There is no `Contents` class.
+ *   - `Message.contents` returns `List<Content>` directly (not a
+ *     `Contents` wrapper).
+ *   - `Message.of(...)` factory methods exist (later deprecated in
+ *     favor of `Message.user(...)` etc., but valid in alpha05).
+ *
+ * If upgrading to a newer LiteRT-LM version, these call sites need
+ * updating.
  */
 class LiteRtlmEngine(private val context: Context) {
 
@@ -125,8 +129,7 @@ class LiteRtlmEngine(private val context: Context) {
             _state.value = LlmState.Error(msg)
             return@withContext Result.failure(IllegalStateException(msg))
         }
-        // Pre-flight: detect HTML error pages (HF returns these on auth
-        // failures even though the URL is "public").
+        // Pre-flight: detect HTML error pages.
         try {
             file.inputStream().use { input ->
                 val head = ByteArray(8)
@@ -162,7 +165,6 @@ class LiteRtlmEngine(private val context: Context) {
             Result.success(Unit)
         } catch (t: Throwable) {
             Log.e(TAG, "LiteRT-LM GPU load failed", t)
-            // Retry with CPU-only backend
             val msg = t.message ?: ""
             val gpuFailed = msg.contains("gpu", ignoreCase = true) ||
                 msg.contains("opencl", ignoreCase = true) ||
@@ -195,30 +197,39 @@ class LiteRtlmEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Build an EngineConfig. In alpha05, `Backend` is an ENUM — so
+     * `Backend.CPU` and `Backend.GPU` are enum constants, not classes.
+     * (In newer LiteRT-LM versions, Backend is a sealed class and these
+     * would need to be `Backend.CPU()` / `Backend.GPU()` instances.)
+     */
     private fun createEngine(path: String, preferGpu: Boolean): Engine {
-        // Backend.CPU() and Backend.GPU() — both are classes that need
-        // instantiation. CPU is a data class (threadCount, numOfThreads
-        // optional params); GPU is a regular class with no params.
         val config = EngineConfig(
             modelPath = path,
-            backend = Backend.CPU(),
-            visionBackend = if (preferGpu) Backend.GPU() else Backend.CPU(),
-            audioBackend = Backend.CPU(),
+            backend = Backend.CPU,
+            visionBackend = if (preferGpu) Backend.GPU else Backend.CPU,
+            audioBackend = Backend.CPU,
             maxNumTokens = 2048
         )
         return Engine(config)
     }
 
+    /**
+     * Create a Conversation with the system prompt baked in.
+     *
+     * In alpha05, ConversationConfig takes `systemMessage: Message?`
+     * (not `systemInstruction: Contents?` — that's a newer API).
+     */
     private fun createConversation(eng: Engine, systemPrompt: String): Conversation {
-        // ConversationConfig.systemInstruction takes a Contents? (not a Message).
-        // Contents.of(text) wraps a single Content.Text.
+        val systemMessage = Message.of(systemPrompt)
         val convConfig = ConversationConfig(
-            systemInstruction = Contents.of(systemPrompt),
+            systemMessage = systemMessage,
+            tools = emptyList(),
             samplerConfig = SamplerConfig(
-                topK = 40,
-                topP = 0.95,
-                temperature = 0.8,
-                seed = 0
+                /* topK = */ 40,
+                /* topP = */ 0.95,
+                /* temperature = */ 0.8,
+                /* seed = */ 0
             )
         )
         return eng.createConversation(convConfig)
@@ -284,7 +295,8 @@ class LiteRtlmEngine(private val context: Context) {
         _state.value = LlmState.Generating
         try {
             // Build the message: optional image + required text.
-            // Use Message.user(Contents.of(...)) — the explicit factory.
+            // In alpha05, Message.of(List<Content>) is the multi-content
+            // factory. (Deprecated in newer versions but valid here.)
             val contents = mutableListOf<Content>()
             if (imageUri != null) {
                 val imageBytes = loadAndDownscaleImage(imageUri, maxDim = 1024)
@@ -296,7 +308,7 @@ class LiteRtlmEngine(private val context: Context) {
                 }
             }
             contents.add(Content.Text(userText))
-            val message = Message.user(Contents.of(contents))
+            val message = Message.of(contents)
 
             // Sync call with 60s timeout. sendMessage blocks until the
             // model finishes generating, then returns the complete Message.
@@ -312,17 +324,19 @@ class LiteRtlmEngine(private val context: Context) {
             Log.i(TAG, "Generation complete: ${fullText.length} chars")
 
             // Fake typing effect — emit the response word-by-word with a
-            // small delay so the UI feels responsive. The actual generation
-            // happened synchronously above; this is just presentation.
-            //
-            // Split on whitespace but preserve it in the chunks we emit
+            // small delay so the UI feels responsive. Split on whitespace
+            // boundaries, preserving the whitespace in each emitted chunk
             // so the bubble renders newlines + indentation correctly.
-            val tokens = fullText.split("(?<=\\s)".toRegex())
-            for (tok in tokens) {
-                if (tok.isEmpty()) continue
-                onChunk(tok)
-                // 8ms per token ≈ 120 tokens/sec — fast enough to not
-                // annoy but visible enough to feel "alive".
+            //
+            // Regex: match word + trailing whitespace. Each match is one
+            // chunk (word + its trailing space/newline/tab).
+            val chunkRegex = Regex("\\S+\\s*|\\s+")
+            for (match in chunkRegex.findAll(fullText)) {
+                val chunk = match.value
+                if (chunk.isEmpty()) continue
+                onChunk(chunk)
+                // 8ms per chunk — fast enough to not annoy but visible
+                // enough to feel "alive".
                 delay(8L)
             }
 
@@ -342,14 +356,13 @@ class LiteRtlmEngine(private val context: Context) {
     /**
      * Convert a LiteRT-LM Message back to a plain string.
      *
-     * `message.contents` is a `Contents` object; `Contents.contents` is
-     * the underlying `List<Content>`. We concatenate all `Content.Text`
-     * parts (vision models sometimes return image+text interleaved, but
-     * we only care about the text for chat display).
+     * In alpha05, `Message.contents` returns `List<Content>` directly
+     * (not a `Contents` wrapper like in newer versions). We filter for
+     * `Content.Text` instances and concatenate their text.
      */
     private fun messageToText(message: Message): String {
         return try {
-            message.contents.contents
+            message.contents
                 .filterIsInstance<Content.Text>()
                 .joinToString("") { it.text }
         } catch (t: Throwable) {
