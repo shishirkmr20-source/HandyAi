@@ -61,7 +61,8 @@ class ChatViewModel(
     private val habitRepo: HabitRepository,
     private val summarizer: com.handyai.llm.AttachmentSummarizer,
     private val preferenceLearner: com.handyai.llm.PreferenceLearner,
-    private val contextCache: com.handyai.llm.ContextCache
+    private val contextCache: com.handyai.llm.ContextCache,
+    private val visionLlm: com.handyai.files.VisionLlm
 ) : ViewModel() {
 
     val messages: StateFlow<List<Message>> = chatRepo.observeMessages(chatId)
@@ -1062,17 +1063,24 @@ class ChatViewModel(
         // 3) Image gen is always available (cloud-based via Pollinations.ai).
         //    isModelLoaded() returns true by default — no model loading needed.
 
+        // v1.4.7: Parse --turbo / --wide / --size etc. flags out of the
+        // prompt before sending to Pollinations. Flags are stripped from
+        // the visible prompt so the bubble caption shows just the prompt.
+        val (cleanPrompt, opts) = com.handyai.llm.ImageGenOptions.parse(prompt)
+        val effectivePrompt = cleanPrompt.ifBlank { prompt }
+
         // 4) Generate
-        _statusText.value = "Generating image via Pollinations.ai… (5–15 seconds)"
+        val sizeNote = if (opts.width != 512 || opts.height != 512) " (${opts.width}x${opts.height})" else ""
+        _statusText.value = "Generating image via Pollinations.ai [${opts.model}]$sizeNote… (5–15 seconds)"
         _streamingChunk.value = ""
         try {
-            val result = imageGen.generate(prompt)
+            val result = imageGen.generateWithOptions(effectivePrompt, opts)
             result.onSuccess { imagePath ->
                 // 5) Persist assistant message with the image
                 chatRepo.appendMessage(
                     chatId = chatId,
                     role = Role.ASSISTANT,
-                    content = prompt,  // shown as caption under the image
+                    content = effectivePrompt,  // shown as caption under the image
                     imagePath = imagePath
                 )
             }.onFailure { err ->
@@ -1270,11 +1278,12 @@ class ChatViewModelFactory(
     private val habitRepo: HabitRepository,
     private val summarizer: com.handyai.llm.AttachmentSummarizer,
     private val preferenceLearner: com.handyai.llm.PreferenceLearner,
-    private val contextCache: com.handyai.llm.ContextCache
+    private val contextCache: com.handyai.llm.ContextCache,
+    private val visionLlm: com.handyai.files.VisionLlm
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache) as T
+        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache, visionLlm) as T
 }
 
 /**

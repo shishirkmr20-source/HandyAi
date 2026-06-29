@@ -122,8 +122,27 @@ class ImageGenEngine(private val context: Context) {
      *
      * Retries up to 3 times on transient failures (5xx, timeout, network
      * blip) with exponential backoff (1s, 2s, 4s) before giving up.
+     *
+     * Uses the default model (flux, 512x512 square). For other models /
+     * aspect ratios, use [generateWithOptions].
      */
     suspend fun generate(prompt: String): Result<String> = withContext(Dispatchers.IO) {
+        generateWithOptions(prompt, ImageGenOptions())
+    }
+
+    /**
+     * v1.4.7: Generate with full control over model + dimensions.
+     *
+     * Pollinations supports several free models:
+     *   - "flux"         — default, best quality
+     *   - "flux-realism" — photorealistic
+     *   - "flux-anime"   — anime style
+     *   - "flux-3d"      — 3D render style
+     *   - "turbo"        — fastest (~3-5s), lower quality
+     *
+     * Aspect ratio presets are encoded as (width, height) pairs.
+     */
+    suspend fun generateWithOptions(prompt: String, opts: ImageGenOptions): Result<String> = withContext(Dispatchers.IO) {
         if (prompt.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Prompt is empty"))
         }
@@ -139,11 +158,18 @@ class ImageGenEngine(private val context: Context) {
             // a fresh seed typically succeeds.
             var lastError: Throwable? = null
             for (attempt in 1..MAX_ATTEMPTS) {
-                Log.i(TAG, "Attempt $attempt/$MAX_ATTEMPTS for prompt (${prompt.length} chars)")
+                Log.i(TAG, "Attempt $attempt/$MAX_ATTEMPTS for prompt (${prompt.length} chars) model=${opts.model} size=${opts.width}x${opts.height}")
                 val attemptSeed = seed + attempt  // vary seed to bypass cache on retry
 
-                val urlStr = "https://image.pollinations.ai/prompt/$encoded" +
-                    "?width=512&height=512&nologo=true&seed=$attemptSeed&model=flux"
+                val urlStr = buildString {
+                    append("https://image.pollinations.ai/prompt/").append(encoded)
+                    append("?width=").append(opts.width)
+                    append("&height=").append(opts.height)
+                    append("&nologo=true")
+                    append("&seed=").append(attemptSeed)
+                    append("&model=").append(opts.model)
+                    if (opts.enhance) append("&enhance=true")
+                }
 
                 val result = tryFetchImage(urlStr)
                 if (result.isSuccess) {
@@ -300,4 +326,83 @@ sealed interface ImageGenState {
     data object Ready : ImageGenState
     data object Generating : ImageGenState
     data class Error(val message: String) : ImageGenState
+}
+
+/**
+ * v1.4.7: Options for image generation. Allows the user to pick a model
+ * variant and aspect ratio via /draw flags (e.g. `/draw --turbo wide: a
+ * landscape at sunset`).
+ *
+ * Defaults match the previous behavior: flux model, 512x512 square.
+ */
+data class ImageGenOptions(
+    /** Pollinations model id. See ImageGenEngine kdoc for the full list. */
+    val model: String = "flux",
+    val width: Int = 512,
+    val height: Int = 512,
+    /**
+     * When true, Pollinations runs the prompt through an LLM to expand it
+     * with extra detail before generating. Slower but often higher
+     * quality. Off by default for speed.
+     */
+    val enhance: Boolean = false
+) {
+    companion object {
+        /**
+         * Parse /draw options from a raw user-typed prompt. Recognizes:
+         *   --turbo            use turbo model (faster, lower quality)
+         *   --realism          use flux-realism
+         *   --anime            use flux-anime
+         *   --3d               use flux-3d
+         *   --enhance          turn on prompt enhancement
+         *   --wide             16:9 landscape (768x432)
+         *   --tall             9:16 portrait (432x768)
+         *   --square           1:1 (512x512) — default, explicit form
+         *   --size WxH         explicit dimensions, e.g. --size 1024x768
+         *
+         * Anything not recognized as a flag is left in the returned
+         * prompt string. Flags can appear in any order, anywhere in the
+         * input.
+         */
+        fun parse(rawPrompt: String): Pair<String, ImageGenOptions> {
+            var model = "flux"
+            var width = 512
+            var height = 512
+            var enhance = false
+
+            val tokens = rawPrompt.split(Regex("\\s+")).toMutableList()
+            val kept = mutableListOf<String>()
+            val iter = tokens.iterator()
+            while (iter.hasNext()) {
+                val tok = iter.next()
+                when (tok.lowercase()) {
+                    "--turbo" -> model = "turbo"
+                    "--realism", "--photo" -> model = "flux-realism"
+                    "--anime" -> model = "flux-anime"
+                    "--3d", "--render" -> model = "flux-3d"
+                    "--enhance", "--detail" -> enhance = true
+                    "--wide", "--landscape", "--16:9" -> { width = 768; height = 432 }
+                    "--tall", "--portrait", "--9:16" -> { width = 432; height = 768 }
+                    "--square", "--1:1" -> { width = 512; height = 512 }
+                    "--size" -> {
+                        if (iter.hasNext()) {
+                            val sizeSpec = iter.next()
+                            val m = Regex("(\\d+)[x×](\\d+)").find(sizeSpec)
+                            if (m != null) {
+                                width = m.groupValues[1].toIntOrNull()?.coerceIn(128, 1024) ?: 512
+                                height = m.groupValues[2].toIntOrNull()?.coerceIn(128, 1024) ?: 512
+                            } else {
+                                kept.add(tok); kept.add(sizeSpec)
+                            }
+                        } else {
+                            kept.add(tok)
+                        }
+                    }
+                    else -> kept.add(tok)
+                }
+            }
+            val cleanPrompt = kept.joinToString(" ").trim()
+            return cleanPrompt to ImageGenOptions(model, width, height, enhance)
+        }
+    }
 }
