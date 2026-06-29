@@ -95,6 +95,10 @@ class HandyAiApp : Application() {
         )
     }
     val webSearch by lazy { WebSearchService() }
+    /** v1.4.8: dedicated weather API (Open-Meteo, free, no key). Returns
+     *  clean Celsius numbers so the LLM can't mislabel °F as °C the way
+     *  it does when fed Bing answer-box snippets. */
+    val weatherService by lazy { com.handyai.net.WeatherService() }
     val modelDownloader by lazy { com.handyai.llm.ModelDownloader(this) }
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

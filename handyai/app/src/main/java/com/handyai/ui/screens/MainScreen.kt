@@ -608,7 +608,8 @@ private fun ChatPane(
             summarizer = app.attachmentSummarizer,
             preferenceLearner = app.preferenceLearner,
             contextCache = app.contextCache,
-            visionLlm = app.visionLlm
+            visionLlm = app.visionLlm,
+            weatherService = app.weatherService
         )
     )
 

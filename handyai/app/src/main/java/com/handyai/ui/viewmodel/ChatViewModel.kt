@@ -63,7 +63,8 @@ class ChatViewModel(
     private val summarizer: com.handyai.llm.AttachmentSummarizer,
     private val preferenceLearner: com.handyai.llm.PreferenceLearner,
     private val contextCache: com.handyai.llm.ContextCache,
-    private val visionLlm: com.handyai.files.VisionLlm
+    private val visionLlm: com.handyai.files.VisionLlm,
+    private val weatherService: com.handyai.net.WeatherService
 ) : ViewModel() {
 
     val messages: StateFlow<List<Message>> = chatRepo.observeMessages(chatId)
@@ -800,13 +801,33 @@ class ChatViewModel(
             android.util.Log.i("HandyAi/ChatVM",
                 "Web search triggered: category=${webDecision.matchedCategory}, " +
                 "trigger='${webDecision.matchedTrigger}', query='${userText.take(60)}'")
-            _statusText.value = "Searching the web…"
+            // ── v1.4.8: WEATHER FAST-PATH ─────────────────────────────
+            // Open-Meteo returns clean Celsius numbers, killing the
+            // "140°C in Delhi" bug at its root. We still cache results
+            // under the same web-result key so re-asking the same
+            // question within 5 minutes is free.
             try {
                 val cached = contextCache.getWebResult(userText)
                 if (cached != null) {
                     android.util.Log.i("HandyAi/ChatVM", "Web search cache HIT for: ${userText.take(60)}")
                     cached
+                } else if (com.handyai.net.WeatherService.isWeatherQuery(userText)) {
+                    _statusText.value = "Fetching live weather…"
+                    val wx = withContext(Dispatchers.IO) { weatherService.getWeather(userText) }
+                    if (wx != null && wx.isNotBlank()) {
+                        val formatted = "Live weather data (from Open-Meteo, authoritative — " +
+                            "quote these numbers exactly):\n$wx"
+                        contextCache.putWebResult(userText, formatted)
+                        formatted
+                    } else {
+                        // Weather service couldn't resolve the city → fall back to web search
+                        _statusText.value = "Searching the web…"
+                        val fresh = withContext(Dispatchers.IO) { webSearch.search(userText) }
+                        if (fresh.isNotBlank()) contextCache.putWebResult(userText, fresh)
+                        fresh
+                    }
                 } else {
+                    _statusText.value = "Searching the web…"
                     val fresh = withContext(Dispatchers.IO) { webSearch.search(userText) }
                     if (fresh.isNotBlank()) {
                         contextCache.putWebResult(userText, fresh)
@@ -1002,19 +1023,49 @@ class ChatViewModel(
         } catch (_: Throwable) {}
         // Web context — only when internet is enabled
         if (internetEnabled.value) {
-            _statusText.value = "Searching the web…"
-            try {
-                val webCtx = withContext(Dispatchers.IO) { webSearch.search(userText) }
-                if (webCtx.isNotBlank()) {
-                    sb.appendLine()
-                    sb.appendLine("Recent web search results for the user's query:")
-                    sb.appendLine(webCtx)
+            // ── v1.4.8: WEATHER FAST-PATH ─────────────────────────────
+            // For weather/temperature queries, try Open-Meteo FIRST. It
+            // returns clean Celsius numbers, which the LLM can quote
+            // verbatim. Previously we ran the generic web search, which
+            // fed Bing answer-box snippets (often Fahrenheit or unrelated
+            // numbers from the factrow) into the model — causing absurd
+            // answers like "140°C in Delhi". Only fall back to web
+            // search if the weather service can't resolve the city
+            // (returns null) or the query isn't about weather.
+            var weatherHandled = false
+            if (com.handyai.net.WeatherService.isWeatherQuery(userText)) {
+                _statusText.value = "Fetching live weather…"
+                try {
+                    val wx = withContext(Dispatchers.IO) { weatherService.getWeather(userText) }
+                    if (wx != null && wx.isNotBlank()) {
+                        sb.appendLine()
+                        sb.appendLine("Live weather data (from Open-Meteo, authoritative — quote these numbers exactly):")
+                        sb.appendLine(wx)
+                        weatherHandled = true
+                    }
+                } catch (t: Throwable) {
+                    android.util.Log.w("HandyAi/ChatVM", "Weather fetch failed: ${t.message}")
+                    // fall through to web search
+                } finally {
+                    _statusText.value = ""
                 }
-            } catch (t: Throwable) {
-                sb.appendLine()
-                sb.appendLine("[Web search failed: ${t.message}]")
-            } finally {
-                _statusText.value = ""
+            }
+
+            if (!weatherHandled) {
+                _statusText.value = "Searching the web…"
+                try {
+                    val webCtx = withContext(Dispatchers.IO) { webSearch.search(userText) }
+                    if (webCtx.isNotBlank()) {
+                        sb.appendLine()
+                        sb.appendLine("Recent web search results for the user's query:")
+                        sb.appendLine(webCtx)
+                    }
+                } catch (t: Throwable) {
+                    sb.appendLine()
+                    sb.appendLine("[Web search failed: ${t.message}]")
+                } finally {
+                    _statusText.value = ""
+                }
             }
         }
         // ── FINAL REMINDER ───────────────────────────────────────────
@@ -1373,11 +1424,12 @@ class ChatViewModelFactory(
     private val summarizer: com.handyai.llm.AttachmentSummarizer,
     private val preferenceLearner: com.handyai.llm.PreferenceLearner,
     private val contextCache: com.handyai.llm.ContextCache,
-    private val visionLlm: com.handyai.files.VisionLlm
+    private val visionLlm: com.handyai.files.VisionLlm,
+    private val weatherService: com.handyai.net.WeatherService
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache, visionLlm) as T
+        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache, visionLlm, weatherService) as T
 }
 
 /**
