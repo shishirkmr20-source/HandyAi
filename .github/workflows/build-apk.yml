@@ -5,6 +5,13 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# Default working directory is the handyai/ subdirectory — the git repo
+# root is the project parent (/), but the actual Gradle Android project
+# lives in handyai/. Every `run:` step below executes from handyai/.
+defaults:
+  run:
+    working-directory: handyai
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -54,6 +61,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: HandyAi-release-apk
-          path: ${{ steps.apk.outputs.path }}
+          path: handyai/app/build/outputs/apk/release/*.apk
           retention-days: 30
           compression-level: 0
