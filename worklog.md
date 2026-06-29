@@ -987,3 +987,26 @@ CROSS-ISSUE NOTES
 
 • No code was modified in this investigation (research-only task). All
   file:line references above are accurate as of the current source state.
+
+---
+Task ID: v1.4.3-fixes
+Agent: main
+Task: Fix (1) vision model crash, (2) Stop button not stopping LLM, (3) excessive newlines, (4) make scroll automatic during streaming. Build v1.4.3 APK and push to GitHub.
+
+Work Log:
+- Read both investigation reports (investigate-vlm-crash, investigate-stop-and-streaming) appended by subagents.
+- VISION CRASH FIX: ModelSettingsViewModel.kt — short-circuited VISION_LITERTLM branch with a friendly error before any native call. LiteRT-LM alpha05's eng.initialize() crashes natively (SIGSEGV) on arm64-v8a; Java try-catch is useless. User is told to use a text model + image attachment (ML Kit OCR + labels) instead.
+- VISION AUTO-LOAD FIX: ModelAutoLoader.kt — skip auto-loading .litertlm files on app launch (would crash on every restart). Silently clear the saved path so the user picks a text model.
+- STOP BUTTON FIX (3 layers): LlmEngine.kt — capture coroutine Job in ProgressListener, check isActive before forwarding each token; on CancellationException, call future.cancel(true) so native generation stops ASAP. ChatViewModel.kt — clear _streamingChunk synchronously in stopGeneration() BEFORE job.cancel() so the bubble vanishes instantly. MainScreen.kt — guard StreamingBubble render with `activeEngineState is Generating` so zombie bubbles can't linger.
+- NEWLINE FLOOD FIX: MarkdownParser.kt — added Pass 4 collapsing 3+ newlines to 2 (handles whitespace between newlines). ChatViewModel.kt — re-sanitize the FULL buffer per chunk (was appending sanitized chunks, which let cross-boundary newline runs slip through). trimEnd() on persist.
+- AUTO-SCROLL FIX: MainScreen.kt — replaced v1.4.2 'isAtBottom' derivedState with a sticky 'userScrolledUp' flag (set on user scroll-up, cleared on FAB tap and new-message-added). Switched to instant scrollToItem for streaming chunks (animations were canceling each other causing stutter). FAB only shows when user has EXPLICITLY scrolled up, not on every transient canScrollForward frame.
+- Bumped version: 1.4.2 -> 1.4.3 (versionCode 35 -> 36) in build.gradle.kts and SettingsScreen.kt.
+- Built release APK: BUILD SUCCESSFUL in 58s (only deprecation warnings, no errors).
+- Copied 127 MB APK to /home/z/my-project/download/handyai-v1.4.3-apk/app-release.apk.
+- Pushed to GitHub: origin/main now at 243da8a (1 commit). Token used inline only, push log cleaned.
+
+Stage Summary:
+- 4 user-reported bugs fixed across 7 files: ModelSettingsViewModel.kt, ModelAutoLoader.kt, LlmEngine.kt, ChatViewModel.kt, MarkdownParser.kt, MainScreen.kt, build.gradle.kts, SettingsScreen.kt.
+- v1.4.3 APK (127 MB) ready at /home/z/my-project/download/handyai-v1.4.3-apk/app-release.apk.
+- GitHub: https://github.com/shishirkmr20-source/HandyAi.git main now at 243da8a.
+- Security: PAT was used inline only; push log cleaned. User should still revoke it since it was shared in chat.
