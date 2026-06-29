@@ -224,12 +224,16 @@ private fun JournalCard(
                 IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, "Delete", modifier = Modifier.size(18.dp)) }
             }
             Spacer(Modifier.height(8.dp))
-            Text(
-                entry.content,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 5,
-                overflow = TextOverflow.Ellipsis
-            )
+            // Only show the content block if there's actually content —
+            // since v1.3.1 entries can be title-only or mood-only.
+            if (entry.content.isNotBlank()) {
+                Text(
+                    entry.content,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 5,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -250,7 +254,16 @@ private fun JournalEditor(
     var mood by remember { mutableStateOf(entry?.mood ?: "") }
 
     val palette = handyAiPalette()
-    val canSave = content.isNotBlank()
+    // ── ENTRY BODY IS NOW OPTIONAL ────────────────────────────────────
+    // Previously `canSave = content.isNotBlank()` — the body was the
+    // only required field. The user wanted to save title-only or
+    // mood-only entries (e.g. just "Mood: happy" with no body, or a
+    // quick title-only reminder).
+    //
+    // Now we require AT LEAST ONE of: title, content, or mood. If all
+    // three are blank, the Save button stays disabled (no point saving
+    // an empty entry).
+    val canSave = title.isNotBlank() || content.isNotBlank() || mood.isNotBlank()
 
     Scaffold(
         topBar = {
@@ -338,15 +351,15 @@ private fun JournalEditor(
             OutlinedTextField(
                 value = content,
                 onValueChange = { content = it },
-                label = { Text("Entry *") },
+                label = { Text("Entry (optional)") },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 240.dp),
                 shape = RoundedCornerShape(12.dp)
             )
-            if (content.isBlank()) {
+            if (title.isBlank() && content.isBlank() && mood.isBlank()) {
                 Text(
-                    "The entry body is required to save.",
+                    "Add at least a title, mood, or entry to save.",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
