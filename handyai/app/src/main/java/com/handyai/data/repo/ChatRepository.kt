@@ -76,6 +76,24 @@ class ChatRepository(
     suspend fun clearContextLabel(id: Long) =
         chatDao.clearContextLabel(id)
 
+    /**
+     * Clear BOTH the label AND the file text from the chat row.
+     *
+     * Called after the user sends a message that consumed an attachment.
+     * The attachment label has already been carried to the message row
+     * (so the chip still shows on the sent bubble), and the file content
+     * was inlined into that one LLM call. We do NOT want the file content
+     * to persist on the chat row — otherwise every subsequent message in
+     * the same chat would re-inline the file content, causing the LLM to
+     * keep referring to a doc the user thinks is long gone.
+     *
+     * If the user wants to ask another question about the same file,
+     * they re-attach it. This matches the UX of ChatGPT and most other
+     * modern chat apps.
+     */
+    suspend fun clearContext(id: Long) =
+        chatDao.clearContext(id)
+
     suspend fun touch(id: Long) = chatDao.touch(id)
 
     suspend fun appendMessage(

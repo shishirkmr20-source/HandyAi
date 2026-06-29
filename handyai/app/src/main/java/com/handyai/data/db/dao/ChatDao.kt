@@ -62,4 +62,19 @@ interface ChatDao {
      */
     @Query("UPDATE chats SET contextLabel = NULL WHERE id = :id")
     suspend fun clearContextLabel(id: Long)
+
+    /**
+     * Clear BOTH the contextLabel AND the context (extracted file text) on
+     * a chat row. Used after the user sends a message that consumed an
+     * attachment — the file content has been inlined into that one LLM
+     * call, and we don't want it polluting every subsequent message in
+     * the same chat (which caused the "LLM keeps referring to the doc"
+     * bug in v1.3.5 and earlier).
+     *
+     * If the user wants to ask another question about the same file,
+     * they re-attach it. This matches the UX of ChatGPT and most other
+     * chat apps: attach → ask one question → file is gone.
+     */
+    @Query("UPDATE chats SET context = NULL, contextLabel = NULL WHERE id = :id")
+    suspend fun clearContext(id: Long)
 }

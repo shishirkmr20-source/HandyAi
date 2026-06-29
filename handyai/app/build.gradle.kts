@@ -13,8 +13,8 @@ android {
         applicationId = "com.handyai"
         minSdk = 26
         targetSdk = 35
-        versionCode = 32
-        versionName = "1.3.7"
+        versionCode = 33
+        versionName = "1.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -110,6 +110,16 @@ dependencies {
     // 'ImageGenerator'". The dependency has been removed; ImageGenEngine is
     // now a stub. See ImageGenEngine.kt for the restoration plan.
     implementation("com.google.mediapipe:tasks-genai:0.10.35")
+
+    // LiteRT-LM — Google's on-device LLM runtime that supports BOTH text-only
+    // .task models AND multimodal .litertlm vision-language models (like
+    // Apple FastVLM-0.5B). Used by [LiteRtlmEngine] for the FastVLM catalog
+    // entry — MediaPipe's LlmInference API can't run .litertlm files.
+    //
+    // Alpha quality (0.0.0-alpha05) but self-contained AAR (no transitive
+    // deps) — confirmed at POM fetch time. If a future version breaks the
+    // build, pin to alpha05 and revisit.
+    implementation("com.google.ai.edge.litertlm:litertlm:0.0.0-alpha05")
 
     // File parsing
     implementation("com.tom-roush:pdfbox-android:2.0.27.0") // PDF (correct groupId has hyphen, not underscore)

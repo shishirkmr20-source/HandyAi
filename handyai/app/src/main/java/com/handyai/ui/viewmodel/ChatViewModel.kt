@@ -52,6 +52,7 @@ class ChatViewModel(
     private val chatId: Long,
     private val chatRepo: ChatRepository,
     private val llm: LlmEngine,
+    private val liteRtlm: com.handyai.llm.LiteRtlmEngine,
     private val imageGen: com.handyai.llm.ImageGenEngine,
     private val tts: TtsEngine,
     private val settings: SettingsRepository,
@@ -134,6 +135,7 @@ class ChatViewModel(
         // Dispatchers.Default and propagate the StateFlow update back to
         // Main (a dispatcher round-trip that makes Stop feel sluggish).
         llm.markReady()
+        liteRtlm.markReady()
         job.cancel()
     }
 
@@ -175,7 +177,48 @@ class ChatViewModel(
             }
             android.util.Log.i("HandyAi/ChatVM",
                 "attachFile: chatId=$chatId, uri=$uri, displayName=$displayName")
-            // When the user has internet enabled, pass preferCloud=true so
+
+            // ── VISION-MODEL FAST PATH (v1.4.0) ──────────────────────────
+            // When a LiteRT-LM vision model (FastVLM) is the active engine,
+            // image attachments are passed DIRECTLY to the model — no OCR,
+            // no ML Kit labels, no cloud BLIP. The model's vision encoder
+            // reads the pixels and produces a real natural-language answer.
+            //
+            // We detect "is image" by MIME type / extension here (without
+            // running the full extractor) and store a vision:// URI marker
+            // on the chat row instead of extracted text. sendUserMessage
+            // sees this marker and dispatches to liteRtlm.generateReplyStream
+            // with the imageUri parameter.
+            val isProbablyImage = displayName.matches(Regex(".*\\.(jpe?g|png|webp|bmp|gif)$", RegexOption.IGNORE_CASE))
+            if (liteRtlm.isModelLoaded() && isProbablyImage) {
+                // Copy the image into app-private storage so the Uri
+                // persists even after the original ContentResolver Uri
+                // becomes invalid (e.g. user revokes the picker grant).
+                val app = com.handyai.HandyAiApp.instance
+                val visionDir = java.io.File(app.filesDir, "vision_attachments").apply { mkdirs() }
+                val safeName = "${System.currentTimeMillis()}_${displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")}"
+                val destFile = java.io.File(visionDir, safeName)
+                try {
+                    resolver.openInputStream(uri)?.use { input ->
+                        destFile.outputStream().use { output -> input.copyTo(output) }
+                    } ?: run {
+                        _errors.send("Could not open image file")
+                        return
+                    }
+                } catch (t: Throwable) {
+                    _errors.send("Could not copy image: ${t.message}")
+                    return
+                }
+                val visionUri = "vision://${destFile.absolutePath}"
+                val label = "image:$displayName"
+                android.util.Log.i("HandyAi/ChatVM",
+                    "attachFile (vision fast path): stored $destFile (${destFile.length()} bytes), " +
+                    "label=$label — will be passed natively to FastVLM")
+                chatRepo.setContext(chatId, visionUri, label)
+                return
+            }
+
+            // When the user has internet enable, pass preferCloud=true so
             // image attachments get a real cloud vision description (BLIP)
             // instead of just ML Kit labels. Documents always use the
             // on-device extractors (PDFBox, POI) — they're already excellent.
@@ -290,21 +333,46 @@ class ChatViewModel(
             android.util.Log.i("HandyAi/ChatVM", "Auto-created journal id=$newId title=${newEntry.title}")
         }
 
-        // 1) Persist user message
+        // 1) Persist user message + consume any attachment on the chat row.
         //
-        // If a file/image is currently attached to the chat (contextLabel is
-        // set), COPY that label onto the user message being persisted, then
-        // CLEAR the chat row's contextLabel. This makes the attachment chip
-        // "move" from the input bar to underneath the sent message bubble.
-        // The chat row's `context` (extracted file text) is preserved so
-        // the LLM can still read it for follow-up questions in this chat.
+        // SNAPSHOT FIRST, THEN CLEAR:
+        //   We need the chat row's current context (extracted file text) AND
+        //   contextLabel (chip text) for THIS LLM call. But we also want to
+        //   clear both from the chat row so the next message in this chat
+        //   doesn't keep referencing the doc. So we read them into locals
+        //   here, persist the user message with the label attached, then
+        //   clear the chat row. The locals are used downstream (step 3.5+)
+        //   to actually inline the file content into the LLM prompt.
+        //
+        // WHY CLEAR BOTH (v1.4.0 — fixes the "LLM keeps referring to the doc"
+        // bug from v1.3.5):
+        //   Before, we only cleared the label (chip moved off input bar) but
+        //   kept the file text in `chat.context`. Every subsequent message
+        //   re-inlined the file content into the LLM prompt — so the LLM
+        //   kept mentioning the doc long after the user thought they were
+        //   done with it.
+        //
+        //   Now we clear both. The file content has already been captured
+        //   in `fileContextSnapshot` below and will be inlined into THIS
+        //   one LLM call. The label is carried onto the user message row
+        //   so the chip still renders under the sent bubble. If the user
+        //   wants another Q about the same doc, they re-attach it —
+        //   matches ChatGPT / Claude UX.
         val chatRowForLabel = chatRepo.getChat(chatId)
         val carriedLabel = chatRowForLabel?.contextLabel
+        // Snapshot the file context BEFORE clearing — used downstream
+        // (step 3.5) to inline the file content into this LLM call.
+        val fileContextSnapshot: Pair<String, Boolean>? = chatRowForLabel?.let { row ->
+            val raw = row.context
+            if (raw.isNullOrBlank()) null
+            else raw to (row.contextLabel?.startsWith("image:") == true)
+        }
         chatRepo.appendMessage(chatId, Role.USER, text, attachmentLabel = carriedLabel)
         if (carriedLabel != null) {
             android.util.Log.i("HandyAi/ChatVM",
-                "Attachment moved: chatId=$chatId label=$carriedLabel → message (chip moves from input bar to message bubble)")
-            chatRepo.clearContextLabel(chatId)
+                "Attachment consumed: chatId=$chatId label=$carriedLabel " +
+                "(chip moved to message bubble; file context cleared from chat row)")
+            chatRepo.clearContext(chatId)
         }
 
         // 2) Title the chat if it's the first message
@@ -319,15 +387,46 @@ class ChatViewModel(
             .filter { !it.isError }
             .map { it.role.value to it.content }
 
-        // 3.5) Fetch the chat's current file/image context ONCE so both
-        //      buildSystemPrompt (normal models) and the inline strategy
-        //      (small models) can use it. Reading from DB avoids stale
-        //      StateFlow values when an attachment was just added.
-        val chatRow = chatRepo.getChat(chatId)
-        val fileContext: Pair<String, Boolean>? = chatRow?.let { row ->
-            val raw = row.context
-            if (raw.isNullOrBlank()) null
-            else raw to (row.contextLabel?.startsWith("image:") == true)
+        // 3.5) Use the file-context snapshot captured in step 1.
+        //      We snapshot BEFORE clearing the chat row (see step 1 comment)
+        //      so the file content is still available for THIS LLM call even
+        //      though the chat row's context field is now null. Subsequent
+        //      messages in this chat will see a null context (the user must
+        //      re-attach the file if they want another Q about it).
+        val fileContext: Pair<String, Boolean>? = fileContextSnapshot
+
+        // 3.55a) VISION-MODEL DISPATCH (v1.4.0)
+        //
+        // If a LiteRT-LM vision model (FastVLM) is the active engine AND
+        // the user just attached an image, dispatch to LiteRtlmEngine
+        // directly — bypassing the MediaPipe path entirely. The image is
+        // passed as native pixels to the model's vision encoder.
+        //
+        // The chat row's context field stores a "vision://<path>" marker
+        // (set by attachFile's vision fast path). We parse out the file
+        // path, build a Uri, and pass it to liteRtlm.generateReplyStream.
+        //
+        // If the vision model is active but the attachment is NOT an image
+        // (e.g. a PDF), we fall through to the regular MediaPipe-style
+        // path — but the LiteRT-LM engine will be used for the LLM call
+        // anyway via the dispatch in step 5 below (TODO: not yet wired —
+        // currently the MediaPipe engine will be used since liteRtlm is
+        // only invoked here for image attachments).
+        if (liteRtlm.isModelLoaded() && fileContext != null && fileContext.second) {
+            val rawContext = fileContext.first
+            if (rawContext.startsWith("vision://")) {
+                val imagePath = rawContext.removePrefix("vision://")
+                val imageFile = java.io.File(imagePath)
+                if (imageFile.exists()) {
+                    android.util.Log.i("HandyAi/ChatVM",
+                        "Vision dispatch: FastVLM active + image attached → liteRtlm.generateReplyStream")
+                    handleVisionReply(text, Uri.fromFile(imageFile))
+                    return@launch
+                } else {
+                    android.util.Log.w("HandyAi/ChatVM",
+                        "Vision file no longer exists: $imagePath — falling back to text-only")
+                }
+            }
         }
 
         // 3.55) MAP-REDUCE SUMMARIZATION FOR LARGE FILES
@@ -795,6 +894,66 @@ class ChatViewModel(
     }
 
     /**
+     * Run a vision-aware reply via the LiteRT-LM engine. The user's text
+     * and the attached image are sent to the model together; the model's
+     * vision encoder reads the pixels and produces a natural-language
+     * answer that references what's in the image.
+     *
+     * Used ONLY when a LiteRT-LM vision model (FastVLM) is the active
+     * engine AND the user attached an image to this message. For text-
+     * only messages or document attachments, the regular MediaPipe path
+     * is used (or, if FastVLM is active, the LiteRT-LM engine with a
+     * text-only message).
+     *
+     * Streaming: LiteRT-LM alpha05 doesn't expose true token streaming
+     * via the public API, so the engine does a sync `sendMessage` call
+     * internally then fake-types the response word-by-word. The user
+     * sees a "Vision model thinking…" status during generation, then
+     * the reply appears with a brief typing effect.
+     */
+    private suspend fun handleVisionReply(userText: String, imageUri: Uri) {
+        _streamingChunk.value = ""
+        _statusText.value = "Vision model analyzing image…"
+        currentGenJob = coroutineContext[Job]
+        try {
+            val result = liteRtlm.generateReplyStream(userText, imageUri) { chunk ->
+                _streamingChunk.value += com.handyai.ui.components.MarkdownParser.sanitize(chunk)
+            }
+            val isCancellation = result.isFailure &&
+                result.exceptionOrNull() is kotlinx.coroutines.CancellationException
+            val partial = _streamingChunk.value
+            if (isCancellation && partial.isBlank()) {
+                android.util.Log.i("HandyAi/ChatVM", "Vision reply stopped by user (no partial text)")
+            } else {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                    result.onSuccess { full ->
+                        val sanitized = com.handyai.ui.components.MarkdownParser.sanitize(full)
+                        val final = if (sanitized.isBlank()) partial.ifBlank { "(no response from vision model)" } else sanitized
+                        chatRepo.appendMessage(chatId, Role.ASSISTANT, final)
+                        if (ttsEnabled.value) {
+                            tts.speak(final, "auto-${System.currentTimeMillis()}")
+                        }
+                    }.onFailure { err ->
+                        if (isCancellation && partial.isNotBlank()) {
+                            chatRepo.appendMessage(chatId, Role.ASSISTANT, partial)
+                            android.util.Log.i("HandyAi/ChatVM",
+                                "Vision reply stopped by user, persisted partial: ${partial.length} chars")
+                        } else {
+                            val msg = err.message ?: err.javaClass.simpleName ?: "Vision model failed"
+                            _errors.send(msg)
+                            chatRepo.appendMessage(chatId, Role.ASSISTANT, "⚠️ $msg", isError = true)
+                        }
+                    }
+                }
+            }
+        } finally {
+            _statusText.value = ""
+            _streamingChunk.value = ""
+            currentGenJob = null
+        }
+    }
+
+    /**
      * Run map-reduce summarization on [fileText] and stream the result
      * into the chat as an assistant message.
      *
@@ -812,6 +971,7 @@ class ChatViewModel(
         // Estimate chunk count for the status message
         val estChunks = (fileText.length / 800) + 1
         _statusText.value = "Summarizing document (~$estChunks parts)…"
+
 
         android.util.Log.i("HandyAi/ChatVM",
             "Map-reduce summary: fileText=${fileText.length} chars, estChunks=$estChunks, model=${llm.activeModelName()}")
@@ -924,6 +1084,7 @@ class ChatViewModelFactory(
     private val chatId: Long,
     private val chatRepo: ChatRepository,
     private val llm: LlmEngine,
+    private val liteRtlm: com.handyai.llm.LiteRtlmEngine,
     private val imageGen: com.handyai.llm.ImageGenEngine,
     private val tts: TtsEngine,
     private val settings: SettingsRepository,
@@ -935,7 +1096,7 @@ class ChatViewModelFactory(
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer) as T
+        ChatViewModel(chatId, chatRepo, llm, liteRtlm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer) as T
 }
 
 /**

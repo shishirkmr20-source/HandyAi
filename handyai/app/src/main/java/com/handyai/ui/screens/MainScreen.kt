@@ -597,6 +597,7 @@ private fun ChatPane(
             chatId = chatId,
             chatRepo = app.chatRepository,
             llm = app.llmEngine,
+            liteRtlm = app.liteRtlmEngine,
             imageGen = app.imageGenEngine,
             tts = app.ttsEngine,
             settings = app.settingsRepository,
@@ -615,6 +616,14 @@ private fun ChatPane(
     val streamingChunk by vm.streamingChunk.collectAsStateWithLifecycle()
     val statusText by vm.statusText.collectAsStateWithLifecycle()
     val llmState by app.llmEngine.state.collectAsStateWithLifecycle()
+    // Also observe the LiteRT-LM engine state — whichever engine is
+    // active drives the Send/Stop button. We prefer the engine that has
+    // a model loaded; if neither is loaded, fall back to MediaPipe state.
+    val liteRtlmState by app.liteRtlmEngine.state.collectAsStateWithLifecycle()
+    val activeEngineState = when {
+        app.liteRtlmEngine.isModelLoaded() -> liteRtlmState
+        else -> llmState
+    }
     val ttsSpeaking by app.ttsEngine.speaking.collectAsStateWithLifecycle()
     val ttsCurrentId by app.ttsEngine.currentId.collectAsStateWithLifecycle()
 
@@ -802,8 +811,8 @@ private fun ChatPane(
                 ttsOn = ttsOn,
                 onToggleTts = { scope.launch { vm.toggleTts(!ttsOn) } },
                 onStop = { vm.stopGeneration() },
-                enabled = llmState !is LlmState.Generating && llmState !is LlmState.Loading,
-                isGenerating = llmState is LlmState.Generating,
+                enabled = activeEngineState !is LlmState.Generating && activeEngineState !is LlmState.Loading,
+                isGenerating = activeEngineState is LlmState.Generating,
                 isListening = sttListening,
                 statusText = statusText,
                 attachmentLabel = chat?.contextLabel
@@ -880,11 +889,11 @@ private fun ChatPane(
                 modifier = Modifier.fillMaxSize()
             ) {
                 // If no model is loaded, show a friendly prompt to set one up.
-                if (llmState is LlmState.Idle || llmState is LlmState.Error) {
+                if (activeEngineState is LlmState.Idle || activeEngineState is LlmState.Error) {
                     NoModelBanner(onOpenModels = onOpenModels)
                 }
 
-                if (messages.isEmpty() && streamingChunk.isEmpty() && llmState !is LlmState.Generating) {
+                if (messages.isEmpty() && streamingChunk.isEmpty() && activeEngineState !is LlmState.Generating) {
                     EmptyChatState()
                 } else {
                     LazyColumn(
@@ -925,7 +934,7 @@ private fun ChatPane(
                         //
                         // Once the first token arrives, the streaming bubble
                         // takes over (it has the orange caret + live text).
-                        val showThinking = (llmState is LlmState.Generating) &&
+                        val showThinking = (activeEngineState is LlmState.Generating) &&
                             streamingChunk.isEmpty() &&
                             (statusText.isBlank() || statusText.startsWith("Generating"))
                         if (showThinking) {

@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 class ModelSettingsViewModel(
     private val settings: SettingsRepository,
     private val llm: LlmEngine,
+    private val liteRtlm: com.handyai.llm.LiteRtlmEngine,
     private val imageGen: ImageGenEngine,
     val downloader: ModelDownloader
 ) : ViewModel() {
@@ -71,25 +72,55 @@ class ModelSettingsViewModel(
 
     fun activate(spec: ModelSpec) = viewModelScope.launch {
         val path = downloader.localPath(spec).absolutePath
-        // All catalog entries are LLM models now — image generation is
-        // a built-in cloud feature (Pollinations.ai) and doesn't need
-        // a model card or activation.
-        val result = llm.setActiveModel(path, spec.id, spec.paramCountB)
-        result.onSuccess {
-            settings.setActiveModel(path, spec.displayName)
+        // ── DISPATCH BY MODEL TYPE ────────────────────────────────────
+        // VISION_LITERTLM models (.litertlm files) go through LiteRtlmEngine;
+        // everything else (.task files) goes through MediaPipe LlmEngine.
+        when (spec.modelType) {
+            ModelType.VISION_LITERTLM -> {
+                // Unload the MediaPipe engine if a .task model was previously
+                // active (the two engines can't run simultaneously without
+                // eating ~5GB of RAM combined).
+                if (llm.isModelLoaded()) {
+                    llm.unload()
+                }
+                val result = liteRtlm.setActiveModel(path)
+                result.onSuccess {
+                    settings.setActiveModel(path, spec.displayName)
+                }
+            }
+            ModelType.LLM -> {
+                // Unload the LiteRT-LM engine if a .litertlm model was
+                // previously active.
+                if (liteRtlm.isModelLoaded()) {
+                    liteRtlm.unload()
+                }
+                val result = llm.setActiveModel(path, spec.id, spec.paramCountB)
+                result.onSuccess {
+                    settings.setActiveModel(path, spec.displayName)
+                }
+            }
+            ModelType.IMAGE_GEN -> {
+                // Image generation is a built-in cloud feature now — no
+                // activation needed.
+            }
         }
     }
 
     fun unload() = viewModelScope.launch {
         llm.unload()
+        liteRtlm.unload()
         imageGen.unload()
         settings.setActiveModel(null, null)
     }
 
     /** Delete the downloaded model file so it can be re-downloaded fresh. */
     fun delete(spec: ModelSpec) = viewModelScope.launch {
-        if (llm.activeModelName() == spec.displayName) {
-            llm.unload()
+        val activeName = llm.activeModelName() ?: liteRtlm.activeModelName()
+        if (activeName == spec.displayName) {
+            when (spec.modelType) {
+                ModelType.VISION_LITERTLM -> liteRtlm.unload()
+                else -> llm.unload()
+            }
             settings.setActiveModel(null, null)
         }
         downloader.localPath(spec).delete()
@@ -126,6 +157,7 @@ class ModelSettingsViewModelFactory(
         ModelSettingsViewModel(
             settings = settings,
             llm = llm,
+            liteRtlm = app.liteRtlmEngine,
             imageGen = app.imageGenEngine,
             downloader = app.modelDownloader
         ) as T

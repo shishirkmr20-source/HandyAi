@@ -57,11 +57,16 @@ object ModelAutoLoader {
     /**
      * Should be called once from HandyAiApp.onCreate(). Reads the saved
      * model path from DataStore and, if non-null and the file still
-     * exists, asks the LlmEngine to load it.
+     * exists, asks the appropriate engine to load it.
+     *
+     * Dispatch by file extension:
+     *   - `.task`       → MediaPipe LlmEngine (text-only models)
+     *   - `.litertlm`   → LiteRT-LM LiteRtlmEngine (vision models)
      */
     fun autoLoad(
         context: Context,
         llm: LlmEngine,
+        liteRtlm: com.handyai.llm.LiteRtlmEngine,
         settings: SettingsRepository
     ) {
         scope.launch {
@@ -83,14 +88,29 @@ object ModelAutoLoader {
                 val savedName = settings.activeModelName.first()
                 val spec = ModelCatalog.ALL.firstOrNull { it.displayName == savedName }
 
-                if (llm.isModelLoaded()) {
-                    Log.i(TAG, "Model already loaded — skipping.")
-                    return@launch
+                // ── DISPATCH BY EXTENSION ──────────────────────────────────
+                // .task → MediaPipe; .litertlm → LiteRT-LM. The two runtimes
+                // can't load each other's files.
+                val isLitertlm = savedPath.endsWith(".litertlm", ignoreCase = true)
+                if (isLitertlm) {
+                    if (liteRtlm.isModelLoaded()) {
+                        Log.i(TAG, "LiteRT-LM model already loaded — skipping.")
+                        return@launch
+                    }
+                    Log.i(TAG, "Auto-loading LiteRT-LM model: $savedPath (${file.length()} bytes)")
+                    val result = liteRtlm.setActiveModel(savedPath)
+                    result.onSuccess { Log.i(TAG, "LiteRT-LM auto-load succeeded.") }
+                        .onFailure { err -> Log.e(TAG, "LiteRT-LM auto-load failed.", err) }
+                } else {
+                    if (llm.isModelLoaded()) {
+                        Log.i(TAG, "MediaPipe model already loaded — skipping.")
+                        return@launch
+                    }
+                    Log.i(TAG, "Auto-loading MediaPipe model: $savedPath (${file.length()} bytes)")
+                    val result = llm.setActiveModel(savedPath, spec?.id, spec?.paramCountB)
+                    result.onSuccess { Log.i(TAG, "MediaPipe auto-load succeeded.") }
+                        .onFailure { err -> Log.e(TAG, "MediaPipe auto-load failed.", err) }
                 }
-                Log.i(TAG, "Auto-loading last active model: $savedPath (${file.length()} bytes)")
-                val result = llm.setActiveModel(savedPath, spec?.id, spec?.paramCountB)
-                result.onSuccess { Log.i(TAG, "Auto-load succeeded.") }
-                    .onFailure { err -> Log.e(TAG, "Auto-load failed.", err) }
             } catch (t: Throwable) {
                 Log.e(TAG, "Auto-load unexpected error.", t)
             }
