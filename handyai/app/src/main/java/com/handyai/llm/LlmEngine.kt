@@ -162,50 +162,55 @@ class LlmEngine(private val context: Context) {
             }.totalMem / (1024L * 1024L)
         } ?: 4096L
 
-        // ── PARAMETER-AWARE MAX_TOKENS (v1.3.6) ─────────────────────────────
-        // PocketPal AI feels fast because it caps the KV cache per-model:
-        // small models get a smaller cache (faster load + faster per-token
-        // attention), big models get a cache just big enough for short
-        // answers (avoids 30s+ generation times on a 3.8B model like Phi-4).
+        // ── PARAMETER-AWARE MAX_TOKENS (v1.3.7 — fixed) ────────────────────
+        // IMPORTANT: MediaPipe's setMaxTokens() sets the TOTAL context length
+        // (input prompt + output), NOT just the output budget. v1.3.6 caps
+        // were too aggressive and caused EMPTY RESPONSES:
+        //   - Phi-4 (>3B) was capped at 768 tokens — a typical prompt
+        //     (system + history + user msg) is 600-800 tokens, leaving
+        //     almost nothing for output → MediaPipe silently returned "".
+        //   - Qwen 0.5B was capped at 1024 — adding a file attachment
+        //     (inlined into the user message, NOT counted against
+        //     INPUT_CHAR_BUDGET) overflowed the limit → empty response.
         //
-        // The KV cache scales as 2 * n_layers * n_kv_heads * head_dim * maxTokens
-        // bytes. For Phi-4-mini (~3.8B, 32 layers, 8 KV heads, 128 head dim),
-        // 2048 tokens = ~134MB of KV cache alone — plus the model weights.
-        // Cutting to 1024 tokens halves that AND makes each generation step
-        // faster (attention is O(seq_len)).
+        // v1.3.7 restores safe caps. The KV cache cost is real but small:
+        //   - Qwen 0.5B (24 layers, 4 KV heads, 64 head dim): 2048 tokens
+        //     = ~12MB KV cache — negligible.
+        //   - Phi-4-mini (32 layers, 8 KV heads, 128 head dim): 2048 tokens
+        //     = ~134MB KV cache — fine on a 4GB+ device (Phi-4's minimum
+        //     requirement anyway).
         //
-        // For Qwen 0.5B (~0.5B, 24 layers, 4 KV heads, 64 head dim), the KV
-        // cache is tiny — we can still afford 1024 tokens, but the model is
-        // already fast enough that the cap matters less than the PROMPT size.
+        // Speed optimization now lives in the PROMPT size (INPUT_CHAR_BUDGET)
+        // and the per-model topK/sampling defaults, NOT in starving the
+        // context window.
         //
-        // Final per-param caps (chosen so first-token latency < 1s on a
-        // mid-range phone):
-        //   - <=0.7B  → 1024  (small enough; speed is prompt-bound)
-        //   - <=1.5B  → 1280  (was 2048; trimmed for speed)
-        //   - <=3.0B  → 1024  (tighter — Phi-4 was the slow case)
-        //   - >3.0B   → 768   (big models: cap aggressively to stay interactive)
+        // Per-param caps (v1.3.7):
+        //   - <=0.7B  → 2048  (was 1024 — caused empty responses with files)
+        //   - <=1.5B  → 2048  (was 1280)
+        //   - <=3.0B  → 2048  (was 1024)
+        //   - >3.0B   → 1536  (was 768 — caused Phi-4 empty responses)
         val paramBasedCap = when {
-            (paramCountB ?: 0.0) <= 0.7 -> 1024
-            (paramCountB ?: 0.0) <= 1.5 -> 1280
-            (paramCountB ?: 0.0) <= 3.0 -> 1024
-            else -> 768
+            (paramCountB ?: 0.0) <= 0.7 -> 2048
+            (paramCountB ?: 0.0) <= 1.5 -> 2048
+            (paramCountB ?: 0.0) <= 3.0 -> 2048
+            else -> 1536
         }
 
         val effectiveMaxTokens = when {
             totalMemMb < 3072 -> {
                 android.util.Log.i(TAG,
-                    "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at ${minOf(768, paramBasedCap)}")
-                minOf(768, paramBasedCap)
+                    "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at ${minOf(1024, paramBasedCap)}")
+                minOf(1024, paramBasedCap)
             }
             totalMemMb < 5120 -> {
                 android.util.Log.i(TAG,
-                    "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at ${minOf(1024, paramBasedCap)}")
-                minOf(1024, paramBasedCap)
+                    "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at ${minOf(1536, paramBasedCap)}")
+                minOf(1536, paramBasedCap)
             }
             memoryClass <= 192 -> {
                 android.util.Log.i(TAG,
-                    "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at ${minOf(1024, paramBasedCap)}")
-                minOf(1024, paramBasedCap)
+                    "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at ${minOf(1536, paramBasedCap)}")
+                minOf(1536, paramBasedCap)
             }
             else -> {
                 android.util.Log.i(TAG,
@@ -455,7 +460,21 @@ class LlmEngine(private val context: Context) {
             // First attempt: full sliding-window history
             val trimmedHistory = trimHistoryToBudget(history, systemPrompt)
             val prompt = buildPrompt(trimmedHistory, systemPrompt)
-            android.util.Log.i(TAG, "Generation attempt: prompt ${prompt.length} chars, ${trimmedHistory.size} turns (true token streaming)")
+            // Rough token estimate (4 chars/token). Log the prompt-vs-context
+            // ratio so we can see in logcat if a future regression pushes the
+            // prompt close to the MAX_TOKENS ceiling (which causes silent
+            // empty responses — see v1.3.7 fix comment above).
+            val estPromptTokens = prompt.length / 4
+            android.util.Log.i(TAG,
+                "Generation attempt: prompt ${prompt.length} chars (~${estPromptTokens} tokens), " +
+                "${trimmedHistory.size} turns (true token streaming)")
+
+            // Track whether the ProgressListener ever fired with a non-empty
+            // token. Used by the sync fallback below — if the async path
+            // returned an empty string AND the listener never fired, we
+            // retry with the synchronous generateResponse() call.
+            // AtomicBoolean because the listener fires from a native thread.
+            val listenerFired = java.util.concurrent.atomic.AtomicBoolean(false)
 
             // Run the async generation on a STANDALONE CoroutineScope so
             // the wait is CANCELLABLE. See the comment block in the
@@ -503,6 +522,7 @@ class LlmEngine(private val context: Context) {
                         @Suppress("DEPRECATION")
                         val listener = com.google.mediapipe.tasks.genai.llminference.ProgressListener<String> { partialToken, done ->
                             if (partialToken.isNotEmpty()) {
+                                listenerFired.set(true)
                                 onChunk(partialToken)
                             }
                             // `done` is true on the final call — the full text
@@ -517,10 +537,36 @@ class LlmEngine(private val context: Context) {
                         // generation threw. We unwrap the cause so the caller
                         // sees the real error (e.g. "unable to parse") instead
                         // of a generic "java.util.concurrent.ExecutionException".
-                        try {
+                        val asyncResult: String = try {
                             future.get()
                         } catch (ee: java.util.concurrent.ExecutionException) {
                             throw ee.cause ?: ee
+                        }
+                        // ── SYNC FALLBACK (v1.3.7) ─────────────────────────
+                        // If the async path returned an EMPTY string AND the
+                        // listener never fired any tokens, the async+listener
+                        // combination silently failed (observed on some
+                        // MediaPipe 0.10.35 builds). Fall back to the
+                        // synchronous generateResponse() call — it doesn't
+                        // stream, but it produces a real reply.
+                        //
+                        // We track whether onChunk was ever called via a
+                        // one-shot flag captured by the listener closure.
+                        // (Can't read _streamingChunk here because the
+                        // ViewModel owns it.)
+                        if (asyncResult.isBlank() && !listenerFired.get()) {
+                            android.util.Log.w(TAG,
+                                "Async generation returned empty + listener never fired — " +
+                                "falling back to synchronous generateResponse()")
+                            try {
+                                engine.generateResponse(prompt)
+                            } catch (syncErr: Throwable) {
+                                android.util.Log.e(TAG,
+                                    "Synchronous fallback also failed", syncErr)
+                                ""
+                            }
+                        } else {
+                            asyncResult
                         }
                     }
                 }
@@ -661,10 +707,15 @@ class LlmEngine(private val context: Context) {
          * is unknown (e.g. a manually-loaded .task file). When the param
          * count IS known (catalog models), [setActiveModel] computes a
          * tighter per-model cap — see the paramBasedCap comment in that
-         * function for the rationale (short version: smaller KV cache =
-         * faster per-token attention, especially on big models like Phi-4).
+         * function for the full rationale.
+         *
+         * v1.3.7: raised from 1024 back to 2048. The v1.3.6 reduction to
+         * 1024 caused empty responses when the user attached files (the
+         * file text is inlined into the user message and not counted
+         * against INPUT_CHAR_BUDGET, so it could overflow a 1024-token
+         * context window).
          */
-        private const val MAX_TOKENS = 1024
+        private const val MAX_TOKENS = 2048
 
         /**
          * Rough character budget for the *input* prompt (system + history +
