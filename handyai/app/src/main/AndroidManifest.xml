@@ -11,6 +11,16 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- LiteRT-LM (vision models like FastVLM) declares minSdk 31 in its
+         AndroidManifest. Our app supports Android 8+ (minSdk 26). This
+         override forces the manifest merger to accept the library on
+         older devices. We guard FastVLM activation at runtime with a
+         Build.VERSION.SDK_INT >= 31 check in ModelSettingsViewModel,
+         so users on Android 8-11 will see the FastVLM catalog entry
+         but activation will fail with a friendly "requires Android 12+"
+         message instead of crashing the app. -->
+    <uses-sdk tools:overrideLibrary="com.google.ai.edge.litertlm" />
+
     <application
         android:name=".HandyAiApp"
         android:allowBackup="true"

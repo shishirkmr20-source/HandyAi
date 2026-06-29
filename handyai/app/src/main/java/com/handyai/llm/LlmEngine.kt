@@ -450,6 +450,19 @@ class LlmEngine(private val context: Context) {
     }
 
     /**
+     * Force the engine state to [LlmState.Error] with the given message.
+     *
+     * Used by [ModelSettingsViewModel] to surface preflight errors that
+     * happen BEFORE any engine call — e.g. "Vision models require
+     * Android 12+" when the user tries to activate FastVLM on an older
+     * device. Without this, the VM has no way to surface the error to
+     * the UI (which observes LlmState via combinedState).
+     */
+    fun surfaceError(message: String) {
+        _state.value = LlmState.Error(message)
+    }
+
+    /**
      * Generate a reply using the full conversation history, streamed token-by-token.
      *
      * [history] is in chronological order (oldest first), already filtered to

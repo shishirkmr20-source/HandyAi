@@ -77,6 +77,19 @@ class ModelSettingsViewModel(
         // everything else (.task files) goes through MediaPipe LlmEngine.
         when (spec.modelType) {
             ModelType.VISION_LITERTLM -> {
+                // LiteRT-LM alpha05 declares minSdk 31 (Android 12) in its
+                // manifest. We use tools:overrideLibrary so the APK installs
+                // on older Android, but the runtime will crash on activation
+                // below API 31. Guard here with a friendly error instead.
+                if (android.os.Build.VERSION.SDK_INT < 31) {
+                    val msg = "Vision models (FastVLM) require Android 12 or newer. " +
+                        "Your device is Android ${android.os.Build.VERSION.RELEASE} " +
+                        "(API ${android.os.Build.VERSION.SDK_INT}). " +
+                        "Use a text-only model (Qwen / Phi / SmolLM) instead — image " +
+                        "attachments will still work via on-device ML Kit OCR + labels."
+                    llm.surfaceError(msg)
+                    return@launch
+                }
                 // Unload the MediaPipe engine if a .task model was previously
                 // active (the two engines can't run simultaneously without
                 // eating ~5GB of RAM combined).
@@ -86,6 +99,8 @@ class ModelSettingsViewModel(
                 val result = liteRtlm.setActiveModel(path)
                 result.onSuccess {
                     settings.setActiveModel(path, spec.displayName)
+                }.onFailure { err ->
+                    llm.surfaceError(err.message ?: "Failed to activate vision model")
                 }
             }
             ModelType.LLM -> {
