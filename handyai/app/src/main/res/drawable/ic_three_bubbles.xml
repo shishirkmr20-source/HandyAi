@@ -1,0 +1,32 @@
+<!--
+  HandyAi — three-bubble conversation mark.
+  Replaces the Gemini-like AutoAwesome sparkle as the app's brand icon.
+  Three overlapping rounded speech bubbles evoke a multi-turn conversation:
+    - Back bubble (top-left, largest)
+    - Middle bubble (right, medium)
+    - Front bubble (bottom-right, small, with tail)
+  Drawn with a single fill so Compose's Icon tint recolors the whole mark.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Back bubble (largest, top-left). Speech bubble with tail at bottom-left. -->
+    <path
+        android:fillColor="#1A8FE3"
+        android:fillAlpha="0.55"
+        android:pathData="M3.0,3.0h12.0c0.83,0 1.5,0.67 1.5,1.5v7.0c0,0.83 -0.67,1.5 -1.5,1.5H10.0L6.0,16.5c-0.34,0.27 -0.83,0.03 -0.83,-0.4V13.5H3.0c-0.83,0 -1.5,-0.67 -1.5,-1.5V4.5C1.5,3.67 2.17,3.0 3.0,3.0z" />
+
+    <!-- Middle bubble (medium, right). Sits over the back bubble's right edge. -->
+    <path
+        android:fillColor="#1A8FE3"
+        android:fillAlpha="0.78"
+        android:pathData="M8.5,8.5h9.5c0.83,0 1.5,0.67 1.5,1.5v5.5c0,0.83 -0.67,1.5 -1.5,1.5H16.0v2.3c0,0.43 -0.49,0.67 -0.83,0.4L11.5,18.5H8.5C7.67,18.5 7.0,17.83 7.0,17.0v-7.0C7.0,9.17 7.67,8.5 8.5,8.5z" />
+
+    <!-- Front bubble (smallest, bottom-right). Tail at bottom-right. -->
+    <path
+        android:fillColor="#1A8FE3"
+        android:pathData="M13.5,13.5h5.0c0.66,0 1.2,0.54 1.2,1.2v3.4c0,0.66 -0.54,1.2 -1.2,1.2h-0.8v1.8c0,0.34 -0.4,0.52 -0.66,0.3l-2.1,-1.7l-1.44,0c-0.66,0 -1.2,-0.54 -1.2,-1.2v-3.8C12.3,14.04 12.84,13.5 13.5,13.5z" />
+</vector>

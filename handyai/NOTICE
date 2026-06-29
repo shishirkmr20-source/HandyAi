@@ -1,0 +1,21 @@
+HandyAi
+Copyright 2026 HandyAi Contributors
+
+This product includes software developed by the following third parties
+(see LICENSE for the full Apache 2.0 terms that apply to this product):
+
+  - Kotlin Standard Library (Apache 2.0) — JetBrains s.r.o.
+  - AndroidX libraries (Apache 2.0) — The Android Open Source Project
+  - Jetpack Compose (Apache 2.0) — The Android Open Source Project
+  - Android Jetpack Room (Apache 2.0) — The Android Open Source Project
+  - AndroidX DataStore (Apache 2.0) — The Android Open Source Project
+  - Material Components for Android (Apache 2.0) — The Android Open Source Project
+  - OkHttp (Apache 2.0) — Square, Inc.
+  - Jsoup (MIT) — Jonathan Hedley
+  - Apache POI (Apache 2.0) — The Apache Software Foundation
+  - PDFBox-Android (Apache 2.0) — Tom Roush
+  - MediaPipe Tasks GenAI (Apache 2.0) — Google LLC
+  - Kotlinx Coroutines (Apache 2.0) — JetBrains s.r.o.
+
+All third-party notices are reproduced from their respective upstream projects
+and remain the property of their respective copyright holders.

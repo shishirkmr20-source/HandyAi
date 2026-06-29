@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">HandyAi</string>
+    <string name="welcome_title">HandyAi</string>
+    <string name="welcome_subtitle">On-device AI. Private by design.</string>
+    <string name="new_chat">New chat</string>
+    <string name="rename">Rename</string>
+    <string name="delete">Delete</string>
+    <string name="settings">Settings</string>
+    <string name="send">Send</string>
+    <string name="speak">Speak</string>
+    <string name="stop_speaking">Stop speaking</string>
+    <string name="attach_file">Attach file</string>
+    <string name="enable_internet">Enable internet</string>
+    <string name="enable_tts">Enable text-to-speech</string>
+    <string name="model_not_loaded">No model loaded</string>
+    <string name="download_model">Download a model</string>
+    <string name="model_settings">Models</string>
+    <string name="type_a_message">Message HandyAi…</string>
+    <string name="empty_chat_title">How can I help you today?</string>
+    <string name="empty_chat_subtitle">Type a message below to start chatting.</string>
+</resources>

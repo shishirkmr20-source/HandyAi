@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HandyAi chat background doodle pattern.
+  Inspired by WhatsApp's translucent line-art doodles.
+
+  - 240x240dp tile, repeated horizontally + vertically by Android's
+    bitmapDrawable tileMode. We render it as a VectorDrawable; the
+    chat composable wraps it in a Painter and tints it with a very
+    low alpha so it sits subtly behind the bubbles without competing
+    with the conversation.
+  - All strokes use a single soft slate color; the consuming Composable
+    applies colorFilter + alpha at draw time. Strokes are intentionally
+    1.5dp thin and decorative — they're meant to be felt, not read.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="240dp"
+    android:viewportWidth="240"
+    android:viewportHeight="240">
+
+    <!-- Speech bubble (top-left) -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M28,32 C28,24 34,18 42,18 L78,18 C86,18 92,24 92,32 L92,52 C92,60 86,66 78,66 L52,66 L40,78 L42,66 C34,66 28,60 28,52 Z" />
+    <!-- Three dots inside speech bubble -->
+    <path android:fillColor="#5B6478" android:pathData="M44,42 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path android:fillColor="#5B6478" android:pathData="M60,42 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path android:fillColor="#5B6478" android:pathData="M76,42 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+
+    <!-- Sparkle / AI star (top-right) -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M196,28 L200,40 L212,44 L200,48 L196,60 L192,48 L180,44 L192,40 Z" />
+    <!-- Small sparkle -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M168,18 L170,24 L176,26 L170,28 L168,34 L166,28 L160,26 L166,24 Z" />
+
+    <!-- Heart (middle-left) -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M34,118 C28,108 14,108 14,122 C14,134 34,148 34,148 C34,148 54,134 54,122 C54,108 40,108 34,118 Z" />
+
+    <!-- Camera (middle-right) -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M170,112 L176,104 L204,104 L210,112 L218,112 C222,112 226,116 226,120 L226,144 C226,148 222,152 218,152 L162,152 C158,152 154,148 154,144 L154,120 C154,116 158,112 162,112 Z" />
+    <!-- Camera lens -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:fillColor="#00000000"
+        android:pathData="M190,124 m-10,0 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0" />
+    <path android:fillColor="#5B6478" android:pathData="M214,122 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+
+    <!-- Paper plane / send (bottom-left) -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M14,196 L54,180 L42,212 L34,200 Z" />
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M34,200 L54,180" />
+
+    <!-- Smiley face (bottom-right) -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:fillColor="#00000000"
+        android:pathData="M196,196 m-22,0 a22,22 0 1,0 44,0 a22,22 0 1,0 -44,0" />
+    <path android:fillColor="#5B6478" android:pathData="M188,190 m-2,0 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0" />
+    <path android:fillColor="#5B6478" android:pathData="M204,190 m-2,0 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0" />
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M186,204 Q196,212 206,204" />
+
+    <!-- Tiny dots scattered for texture -->
+    <path android:fillColor="#5B6478" android:pathData="M120,32 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M140,60 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M110,80 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M130,140 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M108,170 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M148,180 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M84,210 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+    <path android:fillColor="#5B6478" android:pathData="M156,222 m-1.5,0 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0" />
+
+    <!-- Small plus signs -->
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M96,108 L96,118 M91,113 L101,113" />
+    <path
+        android:strokeColor="#5B6478"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M218,84 L218,94 M213,89 L223,89" />
+
+</vector>
