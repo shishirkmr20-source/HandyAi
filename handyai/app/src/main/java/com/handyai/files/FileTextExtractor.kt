@@ -101,18 +101,31 @@ class FileTextExtractor(
     /**
      * Extract text from [uri].
      *
-     * @param preferCloud When true (user is online + has internet enabled),
-     *   image attachments are routed through [CloudImageAnalyzer] first —
-     *   HuggingFace BLIP produces a natural-language description instead
-     *   of just ML Kit labels. If the cloud call fails or [preferCloud]
-     *   is false, falls back to the on-device [ImageAnalyzer]. Documents
-     *   (PDF/DOCX/...) always use the on-device extractors — they're
-     *   already excellent and don't benefit from cloud processing.
+     * @param preferCloud Kept for API compatibility but IGNORED for images
+     *   as of v1.4.1. The user explicitly requested: "while extracting the
+     *   text from image it is not able to extract full text which it was
+     *   able to do so before, dont use the cloud api. just use the native
+     *   text extractor which easily extracts texts quickly."
+     *
+     *   Reasoning:
+     *     - Cloud BLIP returns a one-line caption ("A photo of a plant on
+     *       a desk"), NOT the actual text in the image. For documents /
+     *       screenshots / signs / chat captures, the user wants the full
+     *       OCR text, which ML Kit returns natively in 100-500ms.
+     *     - ML Kit's bundled Latin recognizer runs fully offline, no API
+     *       key, no network latency.
+     *     - Cloud analyzer still exists (CloudImageAnalyzer.kt) and is
+     *       kept for potential future use, but is no longer called from
+     *       the image extraction path. If you want cloud captions, call
+     *       CloudImageAnalyzer directly from a different code path.
+     *
+     *   Documents (PDF/DOCX/etc.) always used on-device parsers and are
+     *   unaffected by this change.
      */
     suspend fun extract(uri: Uri, displayName: String, preferCloud: Boolean = false): Result {
         val ext = displayName.substringAfterLast('.', "").lowercase()
         val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
-        android.util.Log.i(TAG, "Extracting: name=$displayName ext=$ext mime=$mime")
+        android.util.Log.i(TAG, "Extracting: name=$displayName ext=$ext mime=$mime (preferCloud=$preferCloud IGNORED for images)")
 
         // ---- Cache lookup ----------------------------------------------------
         // Read (size, lastModified) fingerprint from the ContentResolver.
@@ -148,58 +161,46 @@ class FileTextExtractor(
         var truncated: Boolean = false
 
         if (isImage(displayName, mime)) {
-            // ── CLOUD VISION (online) ─────────────────────────────────
-            // Try the cloud analyzer first when available + requested.
-            // On any failure (network, rate-limit, parse), we fall through
-            // to the on-device path so the user always gets SOME result.
-            var cloudUsed = false
-            if (preferCloud && cloudImageAnalyzer != null) {
-                android.util.Log.i(TAG, "Trying cloud image analyzer (BLIP) for $displayName")
-                val cloudText = try {
-                    cloudImageAnalyzer.analyze(uri, displayName)
+            // ── NATIVE ML KIT OCR ONLY (v1.4.1) ───────────────────────────
+            // User explicitly asked to skip the cloud analyzer for images
+            // and use the native text extractor which extracts full text
+            // quickly. The cloud BLIP captioner returned one-line
+            // descriptions instead of the actual text content visible in
+            // the image (signs, screenshots, documents, chat captures),
+            // which broke the user's workflow.
+            //
+            // ML Kit OCR returns ALL visible text in 100-500ms, fully
+            // offline. The image labeler adds object/scene tags for
+            // additional context. Combined output is a plain-prose
+            // description suitable for the LLM.
+            //
+            // The cloudImageAnalyzer parameter is kept in the constructor
+            // signature for API stability but is no longer invoked here.
+            if (imageAnalyzer != null) {
+                android.util.Log.i(TAG, "Routing to on-device ImageAnalyzer (ML Kit OCR + labels) — native only, cloud skipped")
+                val ir = try {
+                    imageAnalyzer.analyze(uri, displayName)
                 } catch (t: Throwable) {
-                    android.util.Log.w(TAG, "Cloud image analyzer threw: ${t.message}")
-                    null
+                    android.util.Log.e(TAG, "On-device image analysis failed for $displayName", t)
+                    return Result(
+                        text = "[Image analysis error: ${t.message ?: t.javaClass.simpleName}]",
+                        label = "image:$displayName",
+                        mimeHint = mime,
+                        charsTruncated = false
+                    )
                 }
-                if (cloudText != null && cloudText.isNotBlank()) {
-                    val cap = MAX_CHARS
-                    truncated = cloudText.length > cap
-                    text = if (truncated) cloudText.substring(0, cap) else cloudText
-                    label = "image:$displayName"
-                    method = "cloud-blip"
-                    cloudUsed = true
-                    android.util.Log.i(TAG, "Cloud image analysis OK: ${text.length} chars")
-                }
-            }
-
-            // ── ON-DEVICE FALLBACK (ML Kit OCR + labels) ─────────────
-            if (!cloudUsed) {
-                if (imageAnalyzer != null) {
-                    android.util.Log.i(TAG, "Routing to on-device ImageAnalyzer (OCR + labeling)")
-                    val ir = try {
-                        imageAnalyzer.analyze(uri, displayName)
-                    } catch (t: Throwable) {
-                        android.util.Log.e(TAG, "On-device image analysis failed for $displayName", t)
-                        return Result(
-                            text = "[Image analysis error: ${t.message ?: t.javaClass.simpleName}]",
-                            label = "image:$displayName",
-                            mimeHint = mime,
-                            charsTruncated = false
-                        )
-                    }
-                    android.util.Log.i(TAG, "On-device image analysis OK: ${ir.text.length} chars, hasContent=${ir.hasContent}")
-                    val cap = MAX_CHARS
-                    truncated = ir.text.length > cap
-                    text = if (truncated) ir.text.substring(0, cap) else ir.text
-                    label = ir.label
-                    method = "mlkit-ocr"
-                } else {
-                    // No analyzer configured at all — surface a clear error
-                    text = "[Image analysis not configured — cannot extract content from this image]"
-                    label = "image:$displayName"
-                    truncated = false
-                    method = "none"
-                }
+                android.util.Log.i(TAG, "On-device image analysis OK: ${ir.text.length} chars, hasContent=${ir.hasContent}")
+                val cap = MAX_CHARS
+                truncated = ir.text.length > cap
+                text = if (truncated) ir.text.substring(0, cap) else ir.text
+                label = ir.label
+                method = "mlkit-ocr"
+            } else {
+                // No analyzer configured at all — surface a clear error
+                text = "[Image analysis not configured — cannot extract content from this image]"
+                label = "image:$displayName"
+                truncated = false
+                method = "none"
             }
         } else {
             val raw = when (ext) {

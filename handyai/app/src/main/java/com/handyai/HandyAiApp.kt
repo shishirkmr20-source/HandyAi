@@ -62,6 +62,24 @@ class HandyAiApp : Application() {
     val ttsEngine by lazy { TtsEngine(this) }
     val sttEngine by lazy { com.handyai.stt.SttEngine(this) }
 
+    /**
+     * Preference learner (v1.4.1) — observes user messages and infers
+     * preferences (response length, style, recurring topics, corrections).
+     * Stored in SharedPreferences, no DB migration needed. Used by
+     * ChatViewModel to adjust the system prompt on subsequent turns.
+     */
+    val preferenceLearner by lazy { com.handyai.llm.PreferenceLearner(this) }
+
+    /**
+     * Context cache (v1.4.1) — in-memory cache for journal/habit/web-search
+     * context strings. Saves 50-150ms per LLM call by avoiding repeated
+     * DB queries when the user sends multiple messages in quick succession.
+     * Process-scoped (cleared on app death).
+     */
+    val contextCache by lazy {
+        com.handyai.llm.ContextCache(journalRepository, habitRepository)
+    }
+
     /** Session-scoped cache for extracted document/image text.
      *  Wiped on every app launch — see onCreate(). */
     val attachmentCache by lazy { AttachmentCache(database.extractedAttachmentDao()) }

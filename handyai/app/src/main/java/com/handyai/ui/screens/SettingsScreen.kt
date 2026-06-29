@@ -16,6 +16,7 @@
  */
 package com.handyai.ui.screens
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -87,7 +88,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Column(modifier = Modifier.padding(20.dp)) {
                     Text("HandyAi", style = MaterialTheme.typography.headlineMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer)
-                    Text("Version 1.4.0", style = MaterialTheme.typography.bodyMedium,
+                    Text("Version 1.4.1", style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer)
                     Spacer(Modifier.height(6.dp))
                     Text(
@@ -184,6 +185,14 @@ fun SettingsScreen(onBack: () -> Unit) {
             // Section: Diagnostics
             SectionHeader("Diagnostics")
             CrashLogCard()
+
+            Spacer(Modifier.height(8.dp))
+
+            // Section: Learned Preferences (v1.4.1)
+            // Lets the user see what the PreferenceLearner has inferred
+            // and reset it if it learned something wrong.
+            SectionHeader("Learned preferences")
+            PreferenceLearnerCard()
 
             Spacer(Modifier.height(24.dp))
             Text(
@@ -487,6 +496,135 @@ private fun ThemePickerCard(
                 }
             }
         }
+    }
+}
+
+/**
+ * Preference Learner card (v1.4.1) — shows what the on-device learner
+ * has inferred about the user's preferences (response length, style,
+ * recurring topics, saved corrections) and provides a Reset button
+ * if the learner picked up something wrong.
+ *
+ * The learner observes user messages and adjusts the system prompt
+ * on subsequent turns — see PreferenceLearner.kt for the full design.
+ */
+@Composable
+private fun PreferenceLearnerCard() {
+    val context = LocalContext.current
+    var lengthPref by remember { mutableStateOf("Auto") }
+    var stylePref by remember { mutableStateOf("Default") }
+    var topics by remember { mutableStateOf<List<String>>(emptyList()) }
+    var corrections by remember { mutableStateOf<List<com.handyai.llm.PreferenceLearner.Correction>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        val learner = com.handyai.HandyAiApp.instance.preferenceLearner
+        lengthPref = learner.getLengthPreference().name.lowercase().replaceFirstChar { it.uppercase() }
+        stylePref = learner.getStylePreference().name.lowercase().replaceFirstChar { it.uppercase() }
+        topics = learner.getTopTopics()
+        corrections = learner.getCorrections()
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Psychology,
+                    null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    "Adaptive learner",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "HandyAi observes your messages and adjusts future replies to match your style. " +
+                    "All learning happens on-device — nothing leaves your phone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(12.dp))
+
+            PreferenceRow("Response length", lengthPref)
+            PreferenceRow("Style", stylePref)
+
+            if (topics.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Topics you've discussed",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    topics.joinToString(", "),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            if (corrections.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Saved corrections (${corrections.size})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(4.dp))
+                corrections.take(3).forEach { c ->
+                    Text(
+                        "• ${c.topic}: ${c.correction.take(80)}${if (c.correction.length > 80) "…" else ""}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (lengthPref == "Auto" && stylePref == "Default" &&
+                topics.isEmpty() && corrections.isEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "No preferences learned yet. The learner activates as you chat more.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                )
+            } else {
+                Spacer(Modifier.height(12.dp))
+                TextButton(
+                    onClick = {
+                        com.handyai.HandyAiApp.instance.preferenceLearner.reset()
+                        lengthPref = "Auto"
+                        stylePref = "Default"
+                        topics = emptyList()
+                        corrections = emptyList()
+                        Toast.makeText(context, "Learned preferences cleared", Toast.LENGTH_SHORT).show()
+                    }
+                ) {
+                    Text("Reset learner")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreferenceRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
     }
 }
 

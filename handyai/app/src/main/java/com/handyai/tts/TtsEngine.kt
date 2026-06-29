@@ -70,11 +70,27 @@ class TtsEngine(context: Context) {
     /**
      * Speak the given text. Replaces any current speech.
      * [utteranceId] is propagated via [currentId] so UI can highlight the message.
+     *
+     * ── MARKDOWN SANITIZATION (v1.4.1) ─────────────────────────────────
+     * Before sending to TextToSpeech, the text is passed through
+     * [TtsSpeechSanitizer.sanitize] which:
+     *   - Converts markdown tables (| col | col |) into spoken prose
+     *     ("Columns: Name, Age. Alice 30. Bob 25.")
+     *   - Strips **bold**, #headings, `code`, [links](url), bullet markers
+     *   - Drops the table separator row (|---|---|) entirely
+     *
+     * Without this, the TTS would read pipes and hyphens verbatim:
+     *   "pipe Name pipe Age pipe pipe hyphen hyphen hyphen…"
+     * which is unlistenable and wastes time. The user explicitly asked
+     * for this to be suppressed when voice is enabled.
      */
     fun speak(text: String, utteranceId: String = UUID.randomUUID().toString()) {
         if (text.isBlank()) return
-        // Split into sentence-sized chunks so long messages don't get truncated
-        val chunks = splitIntoChunks(text, maxLen = 280)
+        // Sanitize markdown syntax BEFORE splitting into chunks so the
+        // chunker sees clean prose and doesn't split mid-table-row.
+        val sanitized = TtsSpeechSanitizer.sanitize(text)
+        if (sanitized.isBlank()) return
+        val chunks = splitIntoChunks(sanitized, maxLen = 280)
         chunks.forEachIndexed { i, chunk ->
             val id = if (i == 0) utteranceId else "$utteranceId-$i"
             val mode = if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD

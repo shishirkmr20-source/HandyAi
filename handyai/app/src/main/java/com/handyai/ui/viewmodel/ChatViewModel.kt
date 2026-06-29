@@ -60,7 +60,9 @@ class ChatViewModel(
     private val webSearch: WebSearchService,
     private val journalRepo: JournalRepository,
     private val habitRepo: HabitRepository,
-    private val summarizer: com.handyai.llm.AttachmentSummarizer
+    private val summarizer: com.handyai.llm.AttachmentSummarizer,
+    private val preferenceLearner: com.handyai.llm.PreferenceLearner,
+    private val contextCache: com.handyai.llm.ContextCache
 ) : ViewModel() {
 
     val messages: StateFlow<List<Message>> = chatRepo.observeMessages(chatId)
@@ -314,6 +316,9 @@ class ChatViewModel(
             val newId = habitRepo.save(newHabit)
             habitCreatedName = newHabit.name
             android.util.Log.i("HandyAi/ChatVM", "Auto-created habit id=$newId name=${newHabit.name}")
+            // Invalidate the context cache so the next LLM call sees the
+            // newly-created habit immediately (instead of waiting for TTL).
+            contextCache.invalidatePersonalContext()
         }
 
         val journalIntent = com.handyai.llm.JournalIntentParser.parse(text)
@@ -331,6 +336,26 @@ class ChatViewModel(
             val newId = journalRepo.save(newEntry)
             journalCreatedTitle = newEntry.title
             android.util.Log.i("HandyAi/ChatVM", "Auto-created journal id=$newId title=${newEntry.title}")
+            // Invalidate the context cache so the next LLM call sees the
+            // newly-created journal entry immediately.
+            contextCache.invalidatePersonalContext()
+        }
+
+        // ── PREFERENCE LEARNER OBSERVATION (v1.4.1) ────────────────────
+        // Observe the user's message for preference signals BEFORE we
+        // build the system prompt — that way THIS reply already reflects
+        // any updated preferences (e.g. if the user says "make it shorter",
+        // the next reply will be shorter).
+        //
+        // We also observe for corrections ("no, I meant X") so future
+        // replies on the same topic don't repeat the mistake.
+        try {
+            preferenceLearner.observeLengthSignal(text)
+            preferenceLearner.observeStyleSignal(text)
+            preferenceLearner.observeCorrection(text)
+            preferenceLearner.observeTopic(text)
+        } catch (t: Throwable) {
+            android.util.Log.w("HandyAi/ChatVM", "Preference observation failed (non-fatal): ${t.message}")
         }
 
         // 1) Persist user message + consume any attachment on the chat row.
@@ -486,19 +511,30 @@ class ChatViewModel(
                 history
             }
 
-        // 4) Build system prompt.
-        //    When a file is attached, use a MINIMAL system prompt — no
-        //    habit context, no journal context, no web search, no tool-use
-        //    preamble. This prevents the model's attention from being
-        //    diluted across irrelevant context when it should be reading
-        //    the file content.
-        val systemPrompt = buildSystemPrompt(
+        // 4) Build system prompt using the SMART PROMPT ROUTER (v1.4.1).
+        //
+        // The router scans the user's message and injects ONLY the tool
+        // prompts whose trigger keywords match. For a trivial "hello"
+        // message, the system prompt is ~80 chars (GREETING_PROMPT).
+        // For "add a habit", only the habit-creation rule is added.
+        // This:
+        //   1. Speeds up prefill (smaller prompt = fewer tokens to process)
+        //   2. Improves instruction-following (model isn't diluted across
+        //      5 unrelated instructions)
+        //   3. Lets the user's actual question get more attention budget
+        //
+        // The PreferenceLearner's hint (length/style/topics) is appended
+        // so the model adapts to the user's learned preferences.
+        //
+        // Per-model length constraints are also injected here — SmolLM
+        // (135M params) is too chatty by default and the user explicitly
+        // asked for short/medium/precise replies unless asked for detail.
+        val systemPrompt = buildSmartSystemPrompt(
             userText = text,
             habitCreatedName = habitCreatedName,
             journalCreatedTitle = journalCreatedTitle,
-            includeFileContext = false,  // file content is inlined into user turn
-            fileContext = null,          // don't duplicate it in system prompt
-            minimalMode = hasFile        // strip habit/journal/web when file present
+            hasFile = hasFile,
+            isImage = fileContext?.second == true
         )
 
         // 5) Stream response (typewriter-style chunk emission + memory-safe
@@ -581,6 +617,173 @@ class ChatViewModel(
         }
         currentGenJob = null
         _streamingChunk.value = ""
+    }
+
+    /**
+     * Build a SMART system prompt using [PromptRouter] + [PreferenceLearner]
+     * + per-model length constraints (v1.4.1).
+     *
+     * Pipeline:
+     *   1. If the message is a trivial greeting (hi, hello, thanks) → use
+     *      [PromptRouter.GREETING_PROMPT] (~80 chars). Tiny prompt = near-
+     *      instant prefill on small models.
+     *   2. Otherwise, route through [PromptRouter.route] which selects
+     *      only the tool rules whose triggers match the user's message.
+     *   3. Append the PreferenceLearner's hint (learned length/style/
+     *      topic preferences from previous conversations).
+     *   4. Append per-model length constraints — SmolLM (135M) gets a
+     *      "keep replies SHORT" instruction by default; other small
+     *      models (Qwen 0.5B) get a "be concise" nudge; larger models
+     *      get no length instruction (let them decide).
+     *   5. Append relevant past corrections (if the user has corrected
+     *      the LLM on this topic before).
+     *   6. If a file is attached, append a minimal "read the inlined
+     *      content" instruction (the content itself is in the user turn).
+     *   7. Append journal + habit context (from [ContextCache], which
+     *      avoids re-querying the DB on every message) — but ONLY if
+     *      the user's message looks like it wants personal context.
+     *   8. Append web search results if internet is enabled and the
+     *      router matched the web_search rule (or the user explicitly
+     *      asks for fresh info).
+     *
+     * The resulting prompt is much smaller than v1.4.0's all-inclusive
+     * approach (typically 200-600 chars vs 1500-2500 chars), which:
+     *   - Speeds up prefill (proportional to prompt length)
+     *   - Improves instruction-following (model attention isn't diluted)
+     *   - Lets the user's actual question get more attention budget
+     */
+    private suspend fun buildSmartSystemPrompt(
+        userText: String,
+        habitCreatedName: String? = null,
+        journalCreatedTitle: String? = null,
+        hasFile: Boolean = false,
+        isImage: Boolean = false
+    ): String {
+        // ── 1. TRIVIAL GREETING FAST PATH ──────────────────────────────
+        // For "hi", "hello", "thanks" etc., skip ALL rules and use a
+        // tiny prompt so the reply feels instant on small models.
+        if (!hasFile && habitCreatedName == null && journalCreatedTitle == null &&
+            com.handyai.llm.PromptRouter.isTrivialGreeting(userText)) {
+            android.util.Log.i("HandyAi/ChatVM",
+                "Smart prompt: trivial greeting detected → using GREETING_PROMPT (${com.handyai.llm.PromptRouter.GREETING_PROMPT.length} chars)")
+            return com.handyai.llm.PromptRouter.GREETING_PROMPT
+        }
+
+        // ── 2. ROUTE ───────────────────────────────────────────────────
+        val routed = com.handyai.llm.PromptRouter.route(userText)
+
+        // ── 3. PREFERENCE LEARNER HINT ─────────────────────────────────
+        val prefHint = try { preferenceLearner.buildHint() } catch (_: Throwable) { "" }
+
+        // ── 4. PER-MODEL LENGTH CONSTRAINTS ────────────────────────────
+        // SmolLM 135M is too chatty by default — user explicitly asked
+        // for short/medium/precise replies unless asked for detail.
+        // Other small models (Qwen 0.5B) get a soft "be concise" nudge.
+        // Larger models (1.5B+) get no length instruction (let them decide).
+        val paramCount = llm.activeModelParamCount() ?: 0.0
+        val lengthNudge = when {
+            paramCount <= 0.2 ->  // SmolLM 135M and smaller
+                "DEFAULT LENGTH: SHORT. Reply in 1-3 sentences unless the user explicitly asks for detail, code, lists, or step-by-step explanations. Be precise — no filler, no preamble."
+            paramCount <= 0.7 ->  // Qwen 0.5B
+                "Be concise. Reply briefly unless the user asks for detail."
+            else -> ""  // Qwen 1.5B+, Phi-4 — let them decide
+        }
+
+        // ── 5. RELEVANT CORRECTIONS ───────────────────────────────────
+        // If the user has corrected the LLM on this topic before, remind
+        // the model so it doesn't repeat the mistake.
+        val corrections = try {
+            preferenceLearner.relevantCorrectionsFor(userText)
+        } catch (_: Throwable) { emptyList() }
+        val correctionBlock = if (corrections.isNotEmpty()) {
+            corrections.joinToString(" ") { c ->
+                "Note: previously on '${c.topic}' you said something the user corrected — \"${c.correction.take(120)}\". Don't repeat that mistake."
+            }
+        } else ""
+
+        // ── 6. FILE ATTACHMENT MINIMAL INSTRUCTION ────────────────────
+        // The file content is inlined into the latest user message (see
+        // step 3.6 in sendUserMessage). The system prompt just needs to
+        // tell the model to actually read the inlined content.
+        val fileBlock = if (hasFile) {
+            if (isImage) {
+                "The user attached an image. Its analyzed content (visible text + detected objects) is in your latest user message between 'Image content:' and 'Question:'. Read it and answer based on it. Do not say you cannot see images."
+            } else {
+                "The user attached a document. Its extracted text is in your latest user message between 'Document content:' and 'Question:'. Read it carefully and answer based on it. Do not say you cannot read files. Quote from the extracted text to prove you read it."
+            }
+        } else ""
+
+        // ── 7. JOURNAL + HABIT CONTEXT (only if relevant) ─────────────
+        // Skip these entirely if the user's message has nothing to do
+        // with their personal data — saves ~400-800 chars on the prompt.
+        // Only inject when the router's habit_journal_lookup rule matched,
+        // OR a habit/journal was just created (ack needs the context).
+        val personalCtx = if (routed.matchedRules.any { it.id == "habit_journal_lookup" } ||
+            habitCreatedName != null || journalCreatedTitle != null) {
+            buildString {
+                val jc = try { contextCache.getJournalContext() } catch (_: Throwable) { "" }
+                if (jc.isNotBlank()) {
+                    append(jc).append("\n\n")
+                }
+                val hc = try { contextCache.getHabitContext() } catch (_: Throwable) { "" }
+                if (hc.isNotBlank()) {
+                    append(hc).append("\n\n")
+                }
+            }.trim()
+        } else ""
+
+        // ── 8. WEB SEARCH (only if internet enabled + relevant) ───────
+        // Use the ContextCache to dedupe recent web queries.
+        val webCtx = if (internetEnabled.value &&
+            routed.matchedRules.any { it.id == "web_search" }) {
+            _statusText.value = "Searching the web…"
+            try {
+                val cached = contextCache.getWebResult(userText)
+                if (cached != null) {
+                    android.util.Log.i("HandyAi/ChatVM", "Web search cache HIT for: ${userText.take(60)}")
+                    cached
+                } else {
+                    val fresh = withContext(Dispatchers.IO) { webSearch.search(userText) }
+                    if (fresh.isNotBlank()) {
+                        contextCache.putWebResult(userText, fresh)
+                    }
+                    fresh
+                }
+            } catch (t: Throwable) {
+                "[Web search failed: ${t.message}]"
+            } finally {
+                _statusText.value = ""
+            }
+        } else ""
+
+        // ── ASSEMBLE ──────────────────────────────────────────────────
+        val sb = StringBuilder()
+        sb.append(com.handyai.llm.PromptRouter.buildSystemPrompt(routed, habitCreatedName, journalCreatedTitle))
+        if (lengthNudge.isNotBlank()) {
+            sb.append("\n\n").append(lengthNudge)
+        }
+        if (prefHint.isNotBlank()) {
+            sb.append("\n\nLearned user preference: ").append(prefHint)
+        }
+        if (correctionBlock.isNotBlank()) {
+            sb.append("\n\n").append(correctionBlock)
+        }
+        if (fileBlock.isNotBlank()) {
+            sb.append("\n\n").append(fileBlock)
+        }
+        if (personalCtx.isNotBlank()) {
+            sb.append("\n\n").append(personalCtx)
+        }
+        if (webCtx.isNotBlank()) {
+            sb.append("\n\nRecent web search results:\n").append(webCtx)
+        }
+        val result = sb.toString().trim()
+        android.util.Log.i("HandyAi/ChatVM",
+            "Smart prompt built: ${result.length} chars " +
+            "(rules=${routed.matchedRules.size}, lengthNudge=${lengthNudge.isNotBlank()}, " +
+            "prefHint=${prefHint.isNotBlank()}, corrections=${corrections.size}, " +
+            "file=${hasFile}, personalCtx=${personalCtx.isNotBlank()}, web=${webCtx.isNotBlank()})")
+        return result
     }
 
     private suspend fun buildSystemPrompt(
@@ -1092,11 +1295,13 @@ class ChatViewModelFactory(
     private val webSearch: WebSearchService,
     private val journalRepo: JournalRepository,
     private val habitRepo: HabitRepository,
-    private val summarizer: com.handyai.llm.AttachmentSummarizer
+    private val summarizer: com.handyai.llm.AttachmentSummarizer,
+    private val preferenceLearner: com.handyai.llm.PreferenceLearner,
+    private val contextCache: com.handyai.llm.ContextCache
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        ChatViewModel(chatId, chatRepo, llm, liteRtlm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer) as T
+        ChatViewModel(chatId, chatRepo, llm, liteRtlm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache) as T
 }
 
 /**
