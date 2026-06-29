@@ -174,3 +174,51 @@ Stage Summary:
 - Source .zip download: https://gofile.io/d/goz3yJ (61 KB, 39 Swift files)
 - Cannot produce compiled .ipa on this Linux environment — user must run `xcodegen generate && xcodebuild archive -exportArchive` on a Mac to produce the .ipa. README has the exact commands.
 - CRITICAL: User's GitHub PAT (ghp_DTqG7...Rq30) is STILL VALID and was used again to create the repo and push. User MUST revoke it at https://github.com/settings/tokens — it has now been exposed in plaintext multiple times in this session's conversation context.
+
+---
+Task ID: v1.3.7
+Agent: Super Z (main)
+Task: User reported empty LLM responses from the v1.3.6 APK build.
+
+Work Log:
+- Diagnosed root cause in LlmEngine.kt:
+    v1.3.6 aggressively capped MAX_TOKENS thinking it was the OUTPUT budget:
+      - <=0.7B  -> 1024 tokens (Qwen 0.5B)
+      - <=1.5B  -> 1280 tokens
+      - <=3.0B  -> 1024 tokens
+      - >3.0B   -> 768 tokens  (Phi-4-mini)
+    But MediaPipe's setMaxTokens() sets the TOTAL context length (input + output),
+    not just the output budget.
+    - Phi-4-mini got 768 tokens total. A typical prompt (system + history + user
+      msg) is 600-800 tokens, leaving almost nothing for output -> MediaPipe
+      silently returned an empty string.
+    - Qwen 0.5B got 1024 tokens. Adding a file attachment (inlined into the user
+      message, NOT counted against INPUT_CHAR_BUDGET) overflowed the limit ->
+      empty response.
+- Fixed in LlmEngine.kt:
+    1. Raised per-param caps back to safe values:
+         - <=3.0B  -> 2048 tokens (Qwen 0.5B/1.5B, Phi-4-mini)
+         - >3.0B   -> 1536 tokens (very large models)
+       Also raised the low-RAM caps (768->1024, 1024->1536).
+    2. Added a synchronous fallback: if the async generateResponseAsync() returns
+       an empty string AND the ProgressListener never fired any tokens, retry
+       with the synchronous generateResponse() call. Catches cases where the
+       async+listener path silently fails (observed on some MediaPipe 0.10.35
+       builds) — the sync path doesn't stream but produces a real reply.
+    3. Added prompt-length logging: 'Generation attempt: prompt N chars
+       (~M tokens)' so we can see in logcat if a future regression pushes
+       the prompt close to the MAX_TOKENS ceiling.
+    4. Raised the fallback MAX_TOKENS constant from 1024 back to 2048.
+- Bumped version 1.3.6 -> 1.3.7 (code 31 -> 32).
+- Committed (54b2f08), pushed to origin/main.
+- CI run 28385072682 completed successfully.
+- Downloaded APK artifact (7957336492, 109 MB) and uploaded to gofile.io:
+  https://gofile.io/d/4l37fa
+
+Stage Summary:
+- 3 files modified: LlmEngine.kt (MAX_TOKENS fix + sync fallback + logging),
+  build.gradle.kts (version bump), SettingsScreen.kt (version string)
+- v1.3.7 APK shared at https://gofile.io/d/4l37fa
+- CRITICAL: User's GitHub PAT (ghp_DTqG7...Rq30) is STILL VALID and was used
+  again to push and download the artifact. User MUST revoke it at
+  https://github.com/settings/tokens.
