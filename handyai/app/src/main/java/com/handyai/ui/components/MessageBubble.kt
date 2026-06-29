@@ -337,12 +337,47 @@ fun MessageBubble(
                                 ).show()
                             }
                         )
-                        Text(
-                            text = MarkdownParser.sanitize(text),
-                            style = style,
-                            color = baseColor,
-                            modifier = copyModifier
-                        )
+
+                        // ── Markdown table rendering ───────────────────────────
+                        // The LLM (especially Qwen / Phi) often emits pipe-tables:
+                        //   | Name  | Age |
+                        //   |-------|-----|
+                        //   | Alice | 30  |
+                        // We split the message body into alternating text-blocks
+                        // and table-blocks, render tables as a native Compose
+                        // table (scrollable, striped, bordered), and everything
+                        // else as plain Text. Tables are only parsed for
+                        // assistant non-error messages — user input and error
+                        // bubbles render verbatim so what-you-typed is what-you-see.
+                        val sanitized = MarkdownParser.sanitize(text)
+                        val canRenderTables = !isUser && !isError && !hasImage
+                        val blocks = if (canRenderTables) {
+                            MarkdownTable.splitBlocks(sanitized)
+                        } else {
+                            listOf(MarkdownTable.MessageBlock.Text(sanitized))
+                        }
+
+                        // Wrap in a Column so multiple blocks stack vertically.
+                        // copyModifier is applied to the whole column so
+                        // long-press anywhere in the bubble copies the message.
+                        Column(modifier = copyModifier) {
+                            blocks.forEachIndexed { idx, block ->
+                                when (block) {
+                                    is MarkdownTable.MessageBlock.Text -> {
+                                        if (idx > 0) Spacer(Modifier.height(6.dp))
+                                        Text(
+                                            text = block.content,
+                                            style = style,
+                                            color = baseColor
+                                        )
+                                    }
+                                    is MarkdownTable.MessageBlock.Table -> {
+                                        if (idx > 0) Spacer(Modifier.height(6.dp))
+                                        MarkdownTableView(block.table)
+                                    }
+                                }
+                            }
+                        }
                     }
                     // ─── Attachment chip below user message ────────────────
                     // When a user message "carried" an attachment (file or

@@ -175,7 +175,12 @@ class ChatViewModel(
             }
             android.util.Log.i("HandyAi/ChatVM",
                 "attachFile: chatId=$chatId, uri=$uri, displayName=$displayName")
-            val result = withContext(Dispatchers.IO) { fileExtractor.extract(uri, displayName) }
+            // When the user has internet enabled, pass preferCloud=true so
+            // image attachments get a real cloud vision description (BLIP)
+            // instead of just ML Kit labels. Documents always use the
+            // on-device extractors (PDFBox, POI) — they're already excellent.
+            val preferCloud = internetEnabled.value
+            val result = withContext(Dispatchers.IO) { fileExtractor.extract(uri, displayName, preferCloud = preferCloud) }
             val label = if (result.charsTruncated) "${result.label} (truncated)" else result.label
             android.util.Log.i("HandyAi/ChatVM",
                 "attachFile: extracted ${result.text.length} chars, label=$label, setting context on chatId=$chatId")
@@ -502,7 +507,13 @@ class ChatViewModel(
         // Small on-device models don't reliably follow formatting
         // instructions anyway — they would often bold the first term
         // then forget for the rest of the reply. Plain text is cleaner.
-        sb.appendLine("Reply in plain text. Do not use Markdown, **asterisks**, #headings, or -lists. Just write natural sentences and paragraphs.")
+        //
+        // v1.3.6: Re-allowed pipe-tables (rendered as native Compose tables
+        // in MessageBubble — see MarkdownTable.kt). Still no **bold** /
+        // #headings / -lists because we don't render those and they'd show
+        // as literal characters. Tables ARE rendered, so the model is free
+        // to use them for tabular data.
+        sb.appendLine("Reply in plain text. Do not use **asterisks** or #headings. You MAY use Markdown tables (with pipes | and hyphens -) for tabular data — they will be rendered as proper tables. Keep prose concise.")
 
         // ── MINIMAL MODE ──────────────────────────────────────────────
         // When a file is attached, strip ALL non-essential context so the
@@ -573,9 +584,9 @@ class ChatViewModel(
             sb.appendLine()
             if (isImage) {
                 sb.appendLine("ATTACHMENT CONTEXT — IMAGE:")
-                sb.appendLine("The user has attached an image. The app has already analyzed it on-device using ML Kit: OCR extracted any visible text, and an image labeler detected the top objects/scenes/concepts. The combined result is included below between the markers.")
-                sb.appendLine("You CAN see this image's content — it has been extracted to text and is sitting in this prompt right now. Do NOT claim you cannot see images, do NOT ask the user to upload again, do NOT say \"I can only see the filename\". The filename alone is NOT all you have — read the 'Visible text' and 'What the image shows' lines below and use them.")
-                sb.appendLine("Describe what the image actually shows based on the 'What the image shows' line, and quote any text from the 'Visible text' line if relevant. If 'Visible text' says \"no legible text was detected\", the image has no readable text — describe what the labels tell you instead. If 'What the image shows' says \"no clear objects or scenes were detected\", the image was unclear — say so honestly.")
+                sb.appendLine("The user has attached an image. The app analyzed it: either on-device (ML Kit OCR + image labels) or, when online, via a cloud vision model that produced a natural-language description. The result is included below between the markers.")
+                sb.appendLine("You CAN see this image's content — it has been extracted to text and is sitting in this prompt right now. Do NOT claim you cannot see images, do NOT ask the user to upload again, do NOT say \"I can only see the filename\". The filename alone is NOT all you have — read the lines below and use them.")
+                sb.appendLine("If the content includes a 'Visible text' line, quote from it when relevant. If it includes an 'Image description' line, use that to describe what the image shows. If either says no text/objects were detected, say so honestly instead of making things up.")
                 sb.appendLine("---IMAGE CONTENT START---")
                 sb.appendLine(fileCtx)
                 sb.appendLine("---IMAGE CONTENT END---")
@@ -633,8 +644,9 @@ class ChatViewModel(
         // system prompts (recency bias: they follow the LAST instruction
         // best). Repeat the plain-text rule here so the model doesn't
         // start emitting **bold** markers partway through its reply.
+        // Tables are still allowed (rendered natively).
         sb.appendLine()
-        sb.appendLine("REMINDER: Reply in plain text only. Do not use **asterisks**, #headings, or -lists.")
+        sb.appendLine("REMINDER: Reply in plain text. No **asterisks**, no #headings. Markdown tables (| pipes |) are OK for tabular data.")
         return sb.toString().trim().takeIf { it.isNotEmpty() } ?: ""
     }
 

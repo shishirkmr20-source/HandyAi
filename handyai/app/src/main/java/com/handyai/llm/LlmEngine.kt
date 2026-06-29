@@ -162,26 +162,55 @@ class LlmEngine(private val context: Context) {
             }.totalMem / (1024L * 1024L)
         } ?: 4096L
 
+        // ── PARAMETER-AWARE MAX_TOKENS (v1.3.6) ─────────────────────────────
+        // PocketPal AI feels fast because it caps the KV cache per-model:
+        // small models get a smaller cache (faster load + faster per-token
+        // attention), big models get a cache just big enough for short
+        // answers (avoids 30s+ generation times on a 3.8B model like Phi-4).
+        //
+        // The KV cache scales as 2 * n_layers * n_kv_heads * head_dim * maxTokens
+        // bytes. For Phi-4-mini (~3.8B, 32 layers, 8 KV heads, 128 head dim),
+        // 2048 tokens = ~134MB of KV cache alone — plus the model weights.
+        // Cutting to 1024 tokens halves that AND makes each generation step
+        // faster (attention is O(seq_len)).
+        //
+        // For Qwen 0.5B (~0.5B, 24 layers, 4 KV heads, 64 head dim), the KV
+        // cache is tiny — we can still afford 1024 tokens, but the model is
+        // already fast enough that the cap matters less than the PROMPT size.
+        //
+        // Final per-param caps (chosen so first-token latency < 1s on a
+        // mid-range phone):
+        //   - <=0.7B  → 1024  (small enough; speed is prompt-bound)
+        //   - <=1.5B  → 1280  (was 2048; trimmed for speed)
+        //   - <=3.0B  → 1024  (tighter — Phi-4 was the slow case)
+        //   - >3.0B   → 768   (big models: cap aggressively to stay interactive)
+        val paramBasedCap = when {
+            (paramCountB ?: 0.0) <= 0.7 -> 1024
+            (paramCountB ?: 0.0) <= 1.5 -> 1280
+            (paramCountB ?: 0.0) <= 3.0 -> 1024
+            else -> 768
+        }
+
         val effectiveMaxTokens = when {
             totalMemMb < 3072 -> {
                 android.util.Log.i(TAG,
-                    "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1024")
-                1024
+                    "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at ${minOf(768, paramBasedCap)}")
+                minOf(768, paramBasedCap)
             }
             totalMemMb < 5120 -> {
                 android.util.Log.i(TAG,
-                    "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1280")
-                1280
+                    "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at ${minOf(1024, paramBasedCap)}")
+                minOf(1024, paramBasedCap)
             }
             memoryClass <= 192 -> {
                 android.util.Log.i(TAG,
-                    "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at 1536")
-                1536
+                    "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at ${minOf(1024, paramBasedCap)}")
+                minOf(1024, paramBasedCap)
             }
             else -> {
                 android.util.Log.i(TAG,
-                    "Normal-RAM device (totalMem=${totalMemMb}MB, memoryClass=${memoryClass}MB) — using MAX_TOKENS=$MAX_TOKENS")
-                MAX_TOKENS
+                    "Normal-RAM device (totalMem=${totalMemMb}MB, memoryClass=${memoryClass}MB, params=${paramCountB}B) — using MAX_TOKENS=$paramBasedCap")
+                paramBasedCap
             }
         }
 
@@ -628,21 +657,14 @@ class LlmEngine(private val context: Context) {
         private const val TAG = "HandyAi/LlmEngine"
 
         /**
-         * Maximum tokens the engine will allocate per session.
-         *
-         * Bumped from 1024 → 2048 in v1.1.6. Most litert-community models
-         * (Qwen2.5, Gemma, Phi, SmolLM) ship with 4096–8192 max sequence
-         * length, so 2048 is well within budget. The previous 1024 limit
-         * was so tight that a 1200-char file context + a couple of history
-         * turns + the latest user message would overflow, causing the
-         * engine to throw "unable to parse" or silently truncate the
-         * file content out of the prompt.
-         *
-         * With 2048 tokens, we can comfortably fit ~6000 chars of input
-         * (system prompt + file context + history) and leave ~1000 tokens
-         * (~4000 chars) for the model's output.
+         * Fallback MAX_TOKENS used when the loaded model's parameter count
+         * is unknown (e.g. a manually-loaded .task file). When the param
+         * count IS known (catalog models), [setActiveModel] computes a
+         * tighter per-model cap — see the paramBasedCap comment in that
+         * function for the rationale (short version: smaller KV cache =
+         * faster per-token attention, especially on big models like Phi-4).
          */
-        private const val MAX_TOKENS = 2048
+        private const val MAX_TOKENS = 1024
 
         /**
          * Rough character budget for the *input* prompt (system + history +
@@ -655,16 +677,18 @@ class LlmEngine(private val context: Context) {
          * attachments (PDF / DOCX / PPTX can easily be 5–10KB of text
          * after extraction).
          *
-         * REDUCED to 4000 in v1.3.0: 6000 chars (~1500 tokens) + system
-         * prompt overhead + the model's output (~500 tokens) was pushing
-         * right up against the 2048-token MAX_TOKENS limit. By the 4th
-         * chat turn, accumulated history + a long system prompt would
-         * overflow, causing the native engine to fail. 4000 chars leaves
-         * a safer margin while still accommodating large file attachments
-         * (the file context is capped separately by FILE_CONTEXT_BUDGET
-         * in ChatViewModel).
+         * REDUCED to 3000 in v1.3.6: prompt evaluation cost scales with
+         * seq_len² for attention. On Phi-4-mini (3.8B), a 4000-char prompt
+         * was adding 4+ seconds before the first token appeared. 3000 chars
+         * keeps first-token latency under 2s on mid-range phones while
+         * still leaving room for system prompt + 3-4 history turns + the
+         * latest user message. Larger file attachments are inlined into
+         * the latest user message (capped separately by
+         * FILE_CONTEXT_BUDGET in ChatViewModel) and are NOT counted against
+         * this budget because the inline strategy uses a minimal system
+         * prompt.
          */
-        private const val INPUT_CHAR_BUDGET = 4000
+        private const val INPUT_CHAR_BUDGET = 3000
 
         /**
          * Models with ≤ this many billion parameters are treated as "small"

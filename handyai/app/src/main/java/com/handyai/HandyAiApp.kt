@@ -59,7 +59,12 @@ class HandyAiApp : Application() {
     val attachmentCache by lazy { AttachmentCache(database.extractedAttachmentDao()) }
 
     val fileExtractor by lazy {
-        FileTextExtractor(this, ImageAnalyzer(this), attachmentCache)
+        FileTextExtractor(
+            context = this,
+            imageAnalyzer = ImageAnalyzer(this),
+            cloudImageAnalyzer = com.handyai.files.CloudImageAnalyzer(this),
+            cache = attachmentCache
+        )
     }
     val webSearch by lazy { WebSearchService() }
     val modelDownloader by lazy { com.handyai.llm.ModelDownloader(this) }
