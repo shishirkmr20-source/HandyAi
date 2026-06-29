@@ -30,6 +30,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -72,8 +74,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontWeight
@@ -484,6 +488,30 @@ private fun ChatPane(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val density = LocalDensity.current
+
+    // ── Swipe-left → Models navigation ────────────────────────────────
+    // The ModalNavigationDrawer already handles right-swipe-from-left-edge
+    // to open the chat history drawer. We add a left-swipe (finger moves
+    // right→left) detector on the chat content so the user can flip from
+    // a chat directly to the Models screen.
+    //
+    // -150dp total horizontal drag (less than ~one-third of a typical
+    // phone width) is the trigger threshold. This is high enough that
+    // ordinary scrolling won't fire it, but low enough that a deliberate
+    // flick gets there in one motion.
+    //
+    // The state lives in a plain holder (not mutableStateOf) because it
+    // is only ever read inside the pointerInput coroutine — making it
+    // state would trigger pointless recompositions on every drag frame.
+    val swipeThresholdPx = with(density) { (-150f).dp.toPx() }
+    val swipeState = remember {
+        object {
+            var accumulator = 0f
+            var handled = false
+        }
+    }
 
     // File picker
     val filePicker = rememberLauncherForActivityResult(
@@ -647,6 +675,57 @@ private fun ChatPane(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                // ── Tap outside the input field → dismiss keyboard ───────
+                // detectTapGestures fires for taps anywhere on the chat
+                // content that aren't consumed by an inner clickable
+                // (e.g. the TTS button inside a message bubble). Tapping
+                // on a message bubble, the empty-state hero, or the
+                // doodle background all collapse the soft keyboard —
+                // matching WhatsApp/Telegram behavior.
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = { keyboard?.hide() })
+                }
+                // ── Swipe left → Models ─────────────────────────────────
+                // detectHorizontalDragGestures accumulates the net
+                // horizontal drag. When the finger lifts and the total
+                // is below the negative threshold (i.e. a leftward flick
+                // of at least 150dp), we navigate to Models. Rightward
+                // swipes are intentionally NOT consumed here — they're
+                // left to the ModalNavigationDrawer's own edge-swipe
+                // detector so the chat-history drawer still opens from
+                // the left edge.
+                .pointerInput(Unit) {
+                    detectHorizontalDragGestures(
+                        onDragStart = {
+                            swipeState.accumulator = 0f
+                            swipeState.handled = false
+                        },
+                        onDragEnd = {
+                            if (!swipeState.handled && swipeState.accumulator <= swipeThresholdPx) {
+                                swipeState.handled = true
+                                keyboard?.hide()
+                                onOpenModels()
+                            }
+                            swipeState.accumulator = 0f
+                        },
+                        onDragCancel = {
+                            swipeState.accumulator = 0f
+                            swipeState.handled = false
+                        },
+                        onHorizontalDrag = { _, dragAmount ->
+                            swipeState.accumulator += dragAmount
+                            // Early-trigger: if the user has already
+                            // flung far enough, fire once during the
+                            // drag so the nav feels instant instead of
+                            // waiting for the finger to lift.
+                            if (!swipeState.handled && swipeState.accumulator <= swipeThresholdPx) {
+                                swipeState.handled = true
+                                keyboard?.hide()
+                                onOpenModels()
+                            }
+                        }
+                    )
+                }
         ) {
             // WhatsApp-style translucent doodle background.
             // Drawn behind everything; bubbles sit on top with their
