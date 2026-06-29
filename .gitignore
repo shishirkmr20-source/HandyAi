@@ -1,2 +1,8 @@
 skills/
 node_modules/
+
+# Large binary artifacts — never track APKs or downloaded artifacts
+download/*.zip
+download/*-apk-extract/
+download/*.apk
+tool-results/
