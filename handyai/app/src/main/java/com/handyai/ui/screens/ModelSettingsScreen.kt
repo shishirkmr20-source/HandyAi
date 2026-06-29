@@ -17,8 +17,10 @@
 package com.handyai.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -49,6 +51,40 @@ import kotlinx.coroutines.launch
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ModelSettingsScreen(onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Models") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+            ModelsPanel()
+        }
+    }
+}
+
+/**
+ * Reusable panel that renders the full Models management UI — status banner,
+ * model cards, image-gen test card, and footer notes. Used both by
+ * [ModelSettingsScreen] (full-screen route) and by the Models drawer inside
+ * [MainScreen] (slide-in from the right edge).
+ *
+ * Hosts its own [ModelSettingsViewModel] so the same VM instance is reused
+ * whether Models is opened as a screen or as a drawer — downloads started
+ * in one mode are visible in the other.
+ *
+ * Optional [onClose] callback, when non-null, renders a close (X) button in
+ * the top-right corner. The drawer host passes this so users can dismiss
+ * the drawer without swiping.
+ */
+@Composable
+fun ModelsPanel(onClose: (() -> Unit)? = null) {
     val app = HandyAiApp.instance
     val vm: ModelSettingsViewModel = viewModel(
         factory = ModelSettingsViewModelFactory(
@@ -62,22 +98,10 @@ fun ModelSettingsScreen(onBack: () -> Unit) {
     val combinedState by vm.combinedState.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Models") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
-                    }
-                }
-            )
-        }
-    ) { padding ->
+    Box(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -175,6 +199,33 @@ fun ModelSettingsScreen(onBack: () -> Unit) {
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             )
+            // Bottom safe-area padding so the last card clears the drawer's
+            // bottom inset on devices with gesture nav.
+            Spacer(Modifier.height(24.dp))
+        }
+
+        // Floating close button (top-right) — only shown when embedded in
+        // the drawer. The full-screen ModelSettingsScreen has its own
+        // TopAppBar back arrow instead.
+        if (onClose != null) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                tonalElevation = 3.dp,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(12.dp)
+                    .size(36.dp)
+                    .clickable(onClick = onClose)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Default.Close,
+                        contentDescription = "Close models",
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
         }
     }
 }

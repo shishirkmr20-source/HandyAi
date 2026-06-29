@@ -26,12 +26,15 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -75,6 +78,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -84,6 +88,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.handyai.HandyAiApp
@@ -110,7 +115,6 @@ import kotlinx.coroutines.launch
 @Composable
 fun MainScreen(
     onOpenSettings: () -> Unit,
-    onOpenModels: () -> Unit,
     onOpenJournal: () -> Unit,
     onOpenHabits: () -> Unit
 ) {
@@ -125,6 +129,20 @@ fun MainScreen(
     var activeChatId by rememberSaveable { mutableStateOf(-1L) }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+
+    // ── Models drawer (right side) ────────────────────────────────────
+    // Independent of the chat-history drawer (left side). When open, the
+    // Models panel slides in from the right edge covering ~88% of the
+    // screen width; a scrim dims the rest. Tapping the scrim or swiping
+    // right closes it.
+    //
+    // Callers (ChatPane's top-bar icon + swipe-left gesture) are
+    // responsible for hiding their own soft keyboard before invoking
+    // openModelsDrawer — MainScreen itself has no keyboard controller
+    // because the input field lives inside ChatPane.
+    var modelsDrawerOpen by rememberSaveable { mutableStateOf(false) }
+    val openModelsDrawer: () -> Unit = { modelsDrawerOpen = true }
+    val closeModelsDrawer: () -> Unit = { modelsDrawerOpen = false }
 
     // First-run: if there are no chats yet, create one and select it.
     // If there are chats but activeChatId is unset, pick the most recent.
@@ -191,9 +209,130 @@ fun MainScreen(
                 ChatPane(
                     chatId = activeChatId,
                     onOpenDrawer = { scope.launch { drawerState.open() } },
-                    onOpenModels = onOpenModels
+                    onOpenModels = openModelsDrawer
                 )
             }
+        }
+
+        // ── Models drawer overlay (right side) ───────────────────────
+        // Rendered on top of the chat content. Animated slide-in from
+        // the right edge + scrim fade-in. We use animateFloatAsState so
+        // the open/close transitions are smooth and reversible.
+        ModelsDrawer(
+            isOpen = modelsDrawerOpen,
+            onClose = closeModelsDrawer
+        )
+    }
+}
+
+/**
+ * Right-side slide-in drawer hosting the [ModelsPanel]. Independent of
+ * the left [ModalNavigationDrawer] (chat history) so both drawers can
+ * coexist — left = chats, right = models.
+ *
+ * - Width: 88% of screen (leaves a sliver of chat visible as a close affordance)
+ * - Scrim: black 50% alpha, taps close the drawer
+ * - Animation: 280ms ease-out slide + scrim fade
+ * - Swipe-right to close: a horizontal drag detector on the panel itself
+ *   lets the user fling it shut just like the chat drawer.
+ */
+@Composable
+private fun ModelsDrawer(
+    isOpen: Boolean,
+    onClose: () -> Unit
+) {
+    val density = LocalDensity.current
+    val configuration = LocalConfiguration.current
+    val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
+    val drawerWidthPx = screenWidthPx * 0.88f
+
+    val targetOffset by animateFloatAsState(
+        targetValue = if (isOpen) 0f else drawerWidthPx,
+        animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing),
+        label = "modelsDrawerOffset"
+    )
+    val scrimAlpha by animateFloatAsState(
+        targetValue = if (isOpen) 0.5f else 0f,
+        animationSpec = tween(durationMillis = 220),
+        label = "modelsDrawerScrim"
+    )
+
+    // Swipe-to-close state — accumulates horizontal drag on the panel.
+    // When the finger lifts and the net drag is > 120dp to the right,
+    // we close the drawer.
+    val swipeCloseThresholdPx = with(density) { 120f.dp.toPx() }
+    val swipeState = remember {
+        object {
+            var accumulator = 0f
+            var handled = false
+        }
+    }
+
+    // Don't render anything when fully closed and animation has settled,
+    // so the drawer doesn't intercept touches meant for the chat content.
+    val fullyClosed = !isOpen && targetOffset >= drawerWidthPx - 1f
+    if (fullyClosed && scrimAlpha <= 0.01f) return
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Scrim — only visible while opening or open
+        if (scrimAlpha > 0.01f) {
+            // Empty interactionSource + null indication → no ripple on tap,
+            // which is what we want for a transparent scrim.
+            val scrimInteraction = remember { MutableInteractionSource() }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = scrimAlpha))
+                    .clickable(
+                        interactionSource = scrimInteraction,
+                        indication = null
+                    ) { onClose() }
+            )
+        }
+
+        // Drawer panel — anchored to the right edge, translated by
+        // targetOffset (0 = fully open, drawerWidthPx = fully closed).
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .fillMaxHeight()
+                .width(with(density) { drawerWidthPx.toDp() })
+                .offset { IntOffset(x = targetOffset.roundToInt(), y = 0) }
+                .background(MaterialTheme.colorScheme.surface)
+                .shadow(elevation = 8.dp)
+                // Swipe-right-to-close — only active when the drawer is
+                // open. We don't need to handle left swipes here (those
+                // would just push the panel further off-screen which the
+                // offset animation already handles).
+                .pointerInput(isOpen) {
+                    if (!isOpen) return@pointerInput
+                    detectHorizontalDragGestures(
+                        onDragStart = {
+                            swipeState.accumulator = 0f
+                            swipeState.handled = false
+                        },
+                        onDragEnd = {
+                            if (!swipeState.handled && swipeState.accumulator >= swipeCloseThresholdPx) {
+                                swipeState.handled = true
+                                onClose()
+                            }
+                            swipeState.accumulator = 0f
+                        },
+                        onDragCancel = {
+                            swipeState.accumulator = 0f
+                            swipeState.handled = false
+                        },
+                        onHorizontalDrag = { _, dragAmount ->
+                            swipeState.accumulator += dragAmount
+                            if (!swipeState.handled && swipeState.accumulator >= swipeCloseThresholdPx) {
+                                swipeState.handled = true
+                                onClose()
+                            }
+                        }
+                    )
+                }
+        ) {
+            ModelsPanel(onClose = onClose)
         }
     }
 }

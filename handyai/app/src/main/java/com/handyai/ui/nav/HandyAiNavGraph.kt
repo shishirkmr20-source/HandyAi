@@ -23,13 +23,11 @@ import androidx.navigation.compose.rememberNavController
 import com.handyai.ui.screens.HabitTrackerScreen
 import com.handyai.ui.screens.JournalScreen
 import com.handyai.ui.screens.MainScreen
-import com.handyai.ui.screens.ModelSettingsScreen
 import com.handyai.ui.screens.SettingsScreen
 
 object Routes {
     const val MAIN = "main"
     const val SETTINGS = "settings"
-    const val MODELS = "models"
     const val JOURNAL = "journal"
     const val HABITS = "habits"
 }
@@ -41,9 +39,12 @@ fun HandyAiNavGraph() {
     NavHost(navController = nav, startDestination = Routes.MAIN) {
 
         composable(Routes.MAIN) {
+            // Models is no longer a separate nav destination — it's a
+            // right-side slide-in drawer hosted inside MainScreen. The
+            // drawer can be opened via the top-bar Memory icon or a
+            // left-swipe gesture on the chat content.
             MainScreen(
                 onOpenSettings = { nav.navigate(Routes.SETTINGS) },
-                onOpenModels = { nav.navigate(Routes.MODELS) },
                 onOpenJournal = { nav.navigate(Routes.JOURNAL) },
                 onOpenHabits = { nav.navigate(Routes.HABITS) }
             )
@@ -51,10 +52,6 @@ fun HandyAiNavGraph() {
 
         composable(Routes.SETTINGS) {
             SettingsScreen(onBack = { nav.popBackStack() })
-        }
-
-        composable(Routes.MODELS) {
-            ModelSettingsScreen(onBack = { nav.popBackStack() })
         }
 
         composable(Routes.JOURNAL) {
