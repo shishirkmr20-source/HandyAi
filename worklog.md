@@ -65,3 +65,31 @@ Stage Summary:
 - v1.3.1 APK shared at https://gofile.io/d/VY0JA2
 - Git history cleaned (no more large files blocking pushes)
 - All 14 parser test cases pass
+
+---
+Task ID: v1.3.2
+Agent: Super Z (main)
+Task: Fix intermittent STT "recording error" on 2nd mic tap; add left-swipe → Models navigation; tap outside input dismisses keyboard.
+
+Work Log:
+- Read SttEngine.kt → found root cause of "1st tap works, 2nd errors, 3rd works" pattern: startListening() called stop() which destroy()ed the SpeechRecognizer, then IMMEDIATELY created a new one via createSpeechRecognizer(). The Android SpeechRecognizer service binding teardown is asynchronous — destroying one instance and creating another in the same frame causes the new instance to fail with ERROR_CLIENT or ERROR_RECOGNIZER_BUSY on the very next startListening() call.
+- Rewrote SttEngine.kt with a single shared recognizer pattern:
+  - `recognizer` is created lazily on first use (on main thread via Handler), then reused for every subsequent startListening() call.
+  - `stop()` now calls `cancel()` (not destroy) — the instance stays alive and ready for the next call.
+  - `startListening()` posts creation + startListening to the main handler with a nested post so the recognizer is guaranteed to exist before startListening is called.
+  - Added `shutdown()` for app-level teardown (rarely needed since the engine lives for the app's lifetime).
+  - If startListening throws, the recognizer is destroyed so the next call creates a fresh one (graceful degradation).
+- Read MainScreen.kt ChatPane → found the content Box that wraps DoodleBackground + message list. Added two pointerInput modifiers to this Box:
+  1. `detectTapGestures(onTap = { keyboard?.hide() })` — taps anywhere on chat content (message bubbles, empty space, doodle background) collapse the soft keyboard. Taps on interactive children (TTS button, etc.) are consumed by the child first and don't trigger the hide. Matches WhatsApp/Telegram behavior.
+  2. `detectHorizontalDragGestures` — accumulates net horizontal drag; when it crosses -150dp (leftward flick), calls onOpenModels(). Early-triggers during the drag (doesn't wait for finger lift) for instant-feeling nav. Right swipes are NOT consumed by us — they're left to the ModalNavigationDrawer's edge-swipe detector so the chat-history drawer still opens from the left edge.
+- Swipe state lives in a plain `object { var accumulator; var handled }` holder (not mutableStateOf) because it's only read inside the pointerInput coroutine — making it state would trigger pointless recompositions on every drag frame.
+- Bumped versionCode 26→27, versionName 1.3.1→1.3.2. Updated SettingsScreen version string.
+- Found that .git/config had NO remote configured (previous session's remote was lost). Recovered repo URL from .git/FETCH_HEAD: https://github.com/shishirkmr20-source/HandyAi.git. Added origin remote.
+- PAT ghp_DTqG7...Rq30 still works (user has NOT revoked it yet — reminded again below).
+- Pushed v1.3.2 commit (3e57f6b) to origin/main. CI run 28374125332 completed successfully.
+- Downloaded APK artifact (7952722390, 113 MB) and uploaded to gofile.io: https://gofile.io/d/C83qtr
+
+Stage Summary:
+- 4 files modified: SttEngine.kt (rewritten — shared recognizer), MainScreen.kt (swipe + tap gestures), SettingsScreen.kt (version), build.gradle.kts (version bump)
+- v1.3.2 APK shared at https://gofile.io/d/C83qtr
+- CRITICAL: User's GitHub PAT (ghp_DTqG7...Rq30) is STILL VALID and was used to push this build. User MUST revoke it at https://github.com/settings/tokens after downloading the APK.
