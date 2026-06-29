@@ -604,25 +604,24 @@ class LlmEngine(private val context: Context) {
                             }
                         }
                         val asyncResult: String = try {
-                            val future = sess.predictAsync(listener)
+                            // MediaPipe 0.10.35 session API: the public
+                            // method is `generateResponseAsync(ProgressListener):
+                            // ListenableFuture<String>`. (There's also an
+                            // internal `predictAsync` but it's not public.)
+                            val future = sess.generateResponseAsync(listener)
                             future.get()
                         } catch (ee: java.util.concurrent.ExecutionException) {
                             throw ee.cause ?: ee
                         } catch (predictErr: Throwable) {
-                            // Session predict failed — fall back to the
-                            // engine-level direct call. The session may
-                            // be in a bad state; we'll recreate it next time.
+                            // Session generateResponseAsync failed — fall
+                            // back to the engine-level direct call.
                             android.util.Log.w(TAG,
-                                "Session predictAsync failed — falling back to engine.generateResponse",
+                                "Session generateResponseAsync failed — falling back to engine.generateResponse",
                                 predictErr)
                             runCatching { sess.close() }
                             session = null
                             sessionFingerprint = null
                             sessionTurnCount = 0
-                            // Fall back to the legacy non-session path:
-                            // build a single ChatML prompt from the whole
-                            // trimmed history + system prompt and call
-                            // the engine directly.
                             val fallbackPrompt = buildPrompt(trimmedHistory, systemPrompt)
                             engine.generateResponse(fallbackPrompt)
                         }
@@ -631,7 +630,7 @@ class LlmEngine(private val context: Context) {
                         // retry via engine-level sync call (v1.3.7 fix).
                         if (asyncResult.isBlank() && !listenerFired.get()) {
                             android.util.Log.w(TAG,
-                                "Session predictAsync returned empty + listener never fired — " +
+                                "Session generateResponseAsync returned empty + listener never fired — " +
                                 "falling back to engine.generateResponse(prompt)")
                             try {
                                 val fallbackPrompt = buildPrompt(trimmedHistory, systemPrompt)
@@ -702,14 +701,21 @@ class LlmEngine(private val context: Context) {
         }
         val opts = LlmInferenceSession.LlmInferenceSessionOptions.builder()
             .apply {
-                // Set the system prompt as the session's initial context.
-                // MediaPipe's session applies the model's chat template
-                // automatically when addQueryChunk is called — but the
-                // system prompt is set here via setTopK/setTemperature/etc.
-                // (the actual system prompt text goes into the first
-                // addQueryChunk call as a system message).
+                // Session options in MediaPipe 0.10.35:
+                //   setTopk(Int), setTopp(Double), setTemperature(Float),
+                //   setRandomSeed(Long), setLoraPath(String),
+                //   setGraphConfig(...), setPromptTemplates(...),
+                //   setEnableVisionModality(Boolean), etc.
+                //
+                // NOTE: there is NO setMaxTokens on the session options —
+                // the max-tokens budget is set on the ENGINE options
+                // (LlmInference.LlmInferenceOptions.setMaxTokens) when the
+                // model is loaded. The session inherits that budget.
                 try {
-                    setMaxTokens(2048)
+                    setTopk(40)
+                } catch (_: Throwable) {}
+                try {
+                    setTemperature(0.8f)
                 } catch (_: Throwable) {}
             }
             .build()
