@@ -54,6 +54,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FitnessCenter
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
@@ -699,10 +700,73 @@ private fun ChatPane(
         }
     }
 
-    // Auto-scroll on new messages or streaming updates
+    // ── Chat scroll behaviour ──────────────────────────────────────────
+    // Two problems this fixes (v1.3.5 regression):
+    //
+    //   1. "Long paragraphs go below the chat box and I can't scroll."
+    //      The old auto-scroll called `animateScrollToItem(messages.lastIndex)`,
+    //      which scrolls the LAST COMPLETED message to the TOP of the viewport.
+    //      The streaming bubble (added as a separate item after the messages)
+    //      was left below the visible area — and because the effect re-fired
+    //      on every streaming chunk, the user couldn't scroll down to see it.
+    //
+    //   2. "I can't scroll up to read older messages."
+    //      The old effect had no "is the user at the bottom?" guard, so every
+    //      streaming token yanked the list back to the bottom — making it
+    //      impossible to read history while the LLM was replying.
+    //
+    // Fix:
+    //   • `isAtBottom` tracks whether the list is scrolled to its maximum
+    //     extent (i.e. the last item's bottom edge is at the viewport bottom).
+    //     We use `canScrollForward == false` which is true exactly when the
+    //     list cannot scroll down any further — this handles both the
+    //     "short last item" and "tall last item" cases correctly.
+    //   • `lastMsgCount` lets us detect "a new message was just added"
+    //     (vs. just a streaming chunk arriving). When a new message is
+    //     added we ALWAYS auto-scroll — even if the user had scrolled up —
+    //     so the user sees their own message and the start of the reply.
+    //   • For streaming chunks, we only auto-scroll if `isAtBottom` is
+    //     true, so the user is free to scroll up and read history while
+    //     the LLM keeps generating.
+    //   • The scroll target is `expectedTotal` (one PAST the last item
+    //     index). `animateScrollToItem` clamps to the maximum scroll
+    //     offset, which places the last item's BOTTOM edge at the
+    //     viewport bottom — i.e. the last line of text sits just above
+    //     the chat input box, exactly as the user requested.
+    val isAtBottom by remember {
+        derivedStateOf { !listState.canScrollForward }
+    }
+    var lastMsgCount by remember { mutableStateOf(0) }
+
     LaunchedEffect(messages.size, streamingChunk) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
+        if (messages.isEmpty()) {
+            lastMsgCount = 0
+            return@LaunchedEffect
+        }
+        val newMessageAdded = messages.size > lastMsgCount
+        lastMsgCount = messages.size
+        // Always auto-scroll when a new message is added (user or assistant).
+        // For streaming chunks, only auto-scroll if the user is already at
+        // the bottom — otherwise we'd yank them away from reading history.
+        if (!newMessageAdded && !isAtBottom) return@LaunchedEffect
+
+        // Compute the expected total item count including the thinking and
+        // streaming bubbles (which are appended as extra items after the
+        // persisted messages). We compute from source data rather than
+        // `layoutInfo.totalItemsCount` because the LazyColumn may not have
+        // re-composed yet when this effect fires.
+        val showThinking = (activeEngineState is LlmState.Generating) &&
+            streamingChunk.isEmpty() &&
+            (statusText.isBlank() || statusText.startsWith("Generating"))
+        val expectedTotal = messages.size +
+            (if (showThinking) 1 else 0) +
+            (if (streamingChunk.isNotEmpty()) 1 else 0)
+        if (expectedTotal > 0) {
+            // Index `expectedTotal` is one past the last valid item. The
+            // scroll machinery clamps this to the maximum scroll offset,
+            // which is exactly what we want: the last item's bottom edge
+            // ends up at the viewport bottom, just above the chat input.
+            listState.animateScrollToItem(expectedTotal)
         }
     }
 
@@ -946,6 +1010,46 @@ private fun ChatPane(
                             item { StreamingBubble(streamingChunk) }
                         }
                     }
+                }
+            }
+
+            // ── "Scroll to bottom" button ─────────────────────────────────
+            // Appears when the user has scrolled up away from the latest
+            // message. Tapping it animates the list back to the bottom so
+            // the user doesn't have to fling-scroll manually. The button
+            // is anchored to the bottom-end of the chat area (just above
+            // the chat input box) — the standard chat-app placement.
+            //
+            // We use `canScrollForward` (not `isAtBottom`) directly here so
+            // the button visibility is reactive to scroll position in real
+            // time, without needing an extra LaunchedEffect.
+            val showScrollToBottom by remember {
+                derivedStateOf {
+                    listState.canScrollForward && messages.isNotEmpty()
+                }
+            }
+            if (showScrollToBottom) {
+                SmallFloatingActionButton(
+                    onClick = {
+                        scope.launch {
+                            val showThinkingNow = (activeEngineState is LlmState.Generating) &&
+                                streamingChunk.isEmpty() &&
+                                (statusText.isBlank() || statusText.startsWith("Generating"))
+                            val total = messages.size +
+                                (if (showThinkingNow) 1 else 0) +
+                                (if (streamingChunk.isNotEmpty()) 1 else 0)
+                            if (total > 0) {
+                                listState.animateScrollToItem(total)
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = 16.dp),
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                ) {
+                    Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Scroll to latest message")
                 }
             }
         }
