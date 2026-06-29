@@ -37,6 +37,12 @@ class SettingsRepository(private val context: Context) {
         val DARK_THEME = booleanPreferencesKey("dark_theme")
         val ACTIVE_MODEL_PATH = stringPreferencesKey("active_model_path")
         val ACTIVE_MODEL_NAME = stringPreferencesKey("active_model_name")
+        // v1.4.7: separate active-model keys for the cloud vision and
+        // image-gen engines. Each stores the catalog ModelSpec.id so the
+        // app can re-resolve the spec on launch. null = use the catalog's
+        // recommended default for that category.
+        val ACTIVE_VISION_MODEL_ID = stringPreferencesKey("active_vision_model_id")
+        val ACTIVE_IMGGEN_MODEL_ID = stringPreferencesKey("active_imggen_model_id")
         // Theme picker — string id of a HandyAiThemeId entry.
         // null/missing = CREAM (the original default — no visual change
         // on upgrade from v1.2.7 and earlier).
@@ -68,6 +74,16 @@ class SettingsRepository(private val context: Context) {
     val activeModelName: Flow<String?> =
         context.dataStore.data.map { it[ACTIVE_MODEL_NAME] }
 
+    /** v1.4.7: id of the cloud VLM the user picked on the Models page.
+     *  null = use the catalog's recommended VISION model. */
+    val activeVisionModelId: Flow<String?> =
+        context.dataStore.data.map { it[ACTIVE_VISION_MODEL_ID] }
+
+    /** v1.4.7: id of the cloud image-gen model the user picked on the
+     *  Models page. null = use the catalog's recommended IMAGE_GEN model. */
+    val activeImgGenModelId: Flow<String?> =
+        context.dataStore.data.map { it[ACTIVE_IMGGEN_MODEL_ID] }
+
     suspend fun setInternet(enabled: Boolean) = context.dataStore.edit {
         it[INTERNET_ENABLED] = enabled
     }
@@ -85,5 +101,17 @@ class SettingsRepository(private val context: Context) {
     suspend fun setActiveModel(path: String?, name: String?) = context.dataStore.edit {
         if (path == null) it.remove(ACTIVE_MODEL_PATH) else it[ACTIVE_MODEL_PATH] = path
         if (name == null) it.remove(ACTIVE_MODEL_NAME) else it[ACTIVE_MODEL_NAME] = name
+    }
+
+    /** v1.4.7: set the active cloud vision model. Pass null to revert to
+     *  the catalog's recommended default. */
+    suspend fun setActiveVisionModel(id: String?) = context.dataStore.edit {
+        if (id == null) it.remove(ACTIVE_VISION_MODEL_ID) else it[ACTIVE_VISION_MODEL_ID] = id
+    }
+
+    /** v1.4.7: set the active cloud image-gen model. Pass null to revert
+     *  to the catalog's recommended default. */
+    suspend fun setActiveImgGenModel(id: String?) = context.dataStore.edit {
+        if (id == null) it.remove(ACTIVE_IMGGEN_MODEL_ID) else it[ACTIVE_IMGGEN_MODEL_ID] = id
     }
 }

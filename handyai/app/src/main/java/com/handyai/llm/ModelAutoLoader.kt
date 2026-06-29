@@ -67,14 +67,34 @@ object ModelAutoLoader {
      * `.litertlm` (leftover from a previous FastVLM activation before
      * the upgrade), silently clear the saved path — the runtime that
      * could load those files has been removed.
+     *
+     * v1.4.7: Also restores the active cloud image-gen model selection
+     * (the user picks a Pollinations model on the Models page; we push
+     * it to ImageGenEngine on launch so /draw uses it without a restart).
      */
     fun autoLoad(
         context: Context,
         llm: LlmEngine,
-        settings: SettingsRepository
+        settings: SettingsRepository,
+        imageGen: ImageGenEngine? = null
     ) {
         scope.launch {
             try {
+                // v1.4.7: Restore cloud image-gen model selection.
+                if (imageGen != null) {
+                    val savedImgGenId = settings.activeImgGenModelId.first()
+                    if (!savedImgGenId.isNullOrBlank()) {
+                        val spec = ModelCatalog.ALL.firstOrNull { it.id == savedImgGenId }
+                        if (spec != null && spec.modelType == ModelType.IMAGE_GEN) {
+                            imageGen.setActiveModelId(spec.cloudModelId)
+                            Log.i(TAG, "Restored image-gen model: ${spec.id} (${spec.cloudModelId})")
+                        } else {
+                            Log.w(TAG, "Saved image-gen id '$savedImgGenId' not in catalog — falling back to flux.")
+                            settings.setActiveImgGenModel(null)
+                        }
+                    }
+                }
+
                 val savedPath = settings.activeModelPath.first()
                 if (savedPath.isNullOrBlank()) {
                     Log.i(TAG, "No saved model path — skipping auto-load (first run or after unload).")

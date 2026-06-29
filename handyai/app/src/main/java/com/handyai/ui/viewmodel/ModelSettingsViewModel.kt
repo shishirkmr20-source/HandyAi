@@ -31,6 +31,7 @@ import com.handyai.llm.ModelType
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -42,6 +43,14 @@ class ModelSettingsViewModel(
 ) : ViewModel() {
 
     val activeModelName: StateFlow<String?> = settings.activeModelName
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    /** v1.4.7: id of the cloud VLM the user picked. null = use recommended default. */
+    val activeVisionModelId: StateFlow<String?> = settings.activeVisionModelId
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    /** v1.4.7: id of the cloud image-gen model the user picked. null = use recommended default. */
+    val activeImgGenModelId: StateFlow<String?> = settings.activeImgGenModelId
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     /** Combined state — drives the status banner at the top of ModelSettingsScreen.
@@ -63,22 +72,32 @@ class ModelSettingsViewModel(
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), CombinedEngineState.Idle)
 
-    fun isDownloaded(spec: ModelSpec): Boolean = downloader.isDownloaded(spec)
+    fun isDownloaded(spec: ModelSpec): Boolean = when (spec.modelType) {
+        // Cloud models — never "downloaded" in the file sense. They're
+        // always available (given internet), so report true so the UI
+        // shows the "Activate" button instead of the "Download" button.
+        ModelType.VISION, ModelType.IMAGE_GEN -> true
+        ModelType.LLM -> downloader.isDownloaded(spec)
+    }
 
     fun download(spec: ModelSpec) = viewModelScope.launch {
+        // Cloud models have nothing to download. Guard against the UI
+        // accidentally invoking this (it shouldn't, but be safe).
+        if (spec.modelType != ModelType.LLM) return@launch
         downloader.download(spec)
     }
 
     fun activate(spec: ModelSpec) = viewModelScope.launch {
-        val path = downloader.localPath(spec).absolutePath
         // ── DISPATCH BY MODEL TYPE ────────────────────────────────────
-        // v1.4.5: VISION_LITERTLM removed. Only LLM (.task) and IMAGE_GEN
-        // (cloud) remain. Vision is now a cloud-only pipeline that runs
-        // automatically whenever a user attaches an image to any text-model
-        // chat — see CloudImageAnalyzer.kt + FileTextExtractor.kt.
+        // v1.4.7: Three model types now:
+        //   - LLM       → on-device .task file, requires prior download
+        //   - VISION    → cloud VLM, no download, persist selection in settings
+        //   - IMAGE_GEN → cloud Pollinations, no download, persist selection
+        //                 + apply to ImageGenEngine immediately
         try {
             when (spec.modelType) {
                 ModelType.LLM -> {
+                    val path = downloader.localPath(spec).absolutePath
                     val result = try {
                         llm.setActiveModel(path, spec.id, spec.paramCountB)
                     } catch (t: Throwable) {
@@ -90,9 +109,22 @@ class ModelSettingsViewModel(
                         settings.setActiveModel(path, spec.displayName)
                     }
                 }
+                ModelType.VISION -> {
+                    // Cloud VLM — no engine state to flip. Persist the
+                    // selection; ChatViewModel reads it when an image is
+                    // attached and passes the model id to VisionLlm.ask().
+                    settings.setActiveVisionModel(spec.id)
+                    android.util.Log.i("HandyAi/ModelSettingsVM",
+                        "Active vision model set to ${spec.id} (${spec.cloudModelId})")
+                }
                 ModelType.IMAGE_GEN -> {
-                    // Image generation is a built-in cloud feature now — no
-                    // activation needed.
+                    // Cloud image gen — persist the selection AND push the
+                    // Pollinations model id to the engine immediately so
+                    // the next /draw uses it (no app restart needed).
+                    settings.setActiveImgGenModel(spec.id)
+                    imageGen.setActiveModelId(spec.cloudModelId)
+                    android.util.Log.i("HandyAi/ModelSettingsVM",
+                        "Active image-gen model set to ${spec.id} (${spec.cloudModelId})")
                 }
             }
         } catch (t: Throwable) {
@@ -110,22 +142,50 @@ class ModelSettingsViewModel(
         llm.unload()
         imageGen.unload()
         settings.setActiveModel(null, null)
+        // v1.4.7: also clear cloud-model selections so the cards go back
+        // to showing "Activate" instead of "Unload". The recommended
+        // default is restored on next selection.
+        settings.setActiveVisionModel(null)
+        settings.setActiveImgGenModel(null)
+        imageGen.setActiveModelId("flux")
     }
 
-    /** Delete the downloaded model file so it can be re-downloaded fresh. */
+    /**
+     * v1.4.7: Unload one specific model. For cloud models (VISION /
+     * IMAGE_GEN), "unload" means "clear the user's selection" — there's
+     * no engine state to clear. For LLM, it calls llm.unload() AND
+     * deletes the file.
+     */
     fun delete(spec: ModelSpec) = viewModelScope.launch {
-        val activeName = llm.activeModelName()
-        if (activeName == spec.displayName) {
-            llm.unload()
-            settings.setActiveModel(null, null)
+        when (spec.modelType) {
+            ModelType.LLM -> {
+                val activeName = llm.activeModelName()
+                if (activeName == spec.displayName) {
+                    llm.unload()
+                    settings.setActiveModel(null, null)
+                }
+                downloader.localPath(spec).delete()
+                downloader.reset(spec.id)
+            }
+            ModelType.VISION -> {
+                val currentId = settings.activeVisionModelId.firstOrNull()
+                if (currentId == spec.id) {
+                    settings.setActiveVisionModel(null)
+                }
+            }
+            ModelType.IMAGE_GEN -> {
+                val currentId = settings.activeImgGenModelId.firstOrNull()
+                if (currentId == spec.id) {
+                    settings.setActiveImgGenModel(null)
+                    imageGen.setActiveModelId("flux")
+                }
+            }
         }
-        downloader.localPath(spec).delete()
-        downloader.reset(spec.id)
     }
 
     /** Clear the saved download state for one model (e.g. dismiss an error). */
     fun resetState(spec: ModelSpec) {
-        downloader.reset(spec.id)
+        if (spec.modelType == ModelType.LLM) downloader.reset(spec.id)
     }
 }
 

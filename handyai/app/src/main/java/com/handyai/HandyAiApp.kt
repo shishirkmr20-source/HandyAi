@@ -50,6 +50,13 @@ class HandyAiApp : Application() {
      *  Image Generator). Separate from [llmEngine] — the two tasks use
      *  different .task file formats and cannot share a session. */
     val imageGenEngine by lazy { com.handyai.llm.ImageGenEngine(this) }
+
+    /** v1.4.7: True cloud multimodal Vision LLM. Answers user questions
+     *  about attached images via HuggingFace's free Inference API. The
+     *  user picks which VLM to use on the Models page; the active model
+     *  id is read from settings by ChatViewModel and passed through to
+     *  VisionLlm.ask(). */
+    val visionLlm by lazy { com.handyai.files.VisionLlm(this) }
     /** Map-reduce summarization pipeline for large attached documents.
      *  Uses [llmEngine] under the hood but with tiny focused prompts
      *  that even 0.5B models can handle reliably. */
@@ -132,7 +139,10 @@ class HandyAiApp : Application() {
         // manually unload + reload every time they reopen the app.
         // Image generation is now cloud-based (Pollinations.ai) and
         // doesn't need auto-loading.
-        com.handyai.llm.ModelAutoLoader.autoLoad(this, llmEngine, settingsRepository)
+        // v1.4.7: also restore the active cloud image-gen model selection.
+        com.handyai.llm.ModelAutoLoader.autoLoad(
+            this, llmEngine, settingsRepository, imageGenEngine
+        )
     }
 
     companion object {

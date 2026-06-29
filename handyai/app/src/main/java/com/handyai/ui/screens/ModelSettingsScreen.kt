@@ -94,6 +94,8 @@ fun ModelsPanel(onClose: (() -> Unit)? = null) {
         )
     )
     val activeName by vm.activeModelName.collectAsStateWithLifecycle(null)
+    val activeVisionId by vm.activeVisionModelId.collectAsStateWithLifecycle(null)
+    val activeImgGenId by vm.activeImgGenModelId.collectAsStateWithLifecycle(null)
     val downloadStates by vm.downloader.states.collectAsStateWithLifecycle(emptyMap())
     val combinedState by vm.combinedState.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -109,12 +111,12 @@ fun ModelsPanel(onClose: (() -> Unit)? = null) {
             // Status banner — adapts to whichever engine is active
             when (val s = combinedState) {
                 is CombinedEngineState.LlmReady -> InfoBanner(
-                    text = "Active: ${activeName ?: "model"}",
+                    text = "Active LLM: ${activeName ?: "model"}",
                     icon = Icons.Default.CheckCircle,
                     color = MaterialTheme.colorScheme.secondaryContainer
                 )
                 is CombinedEngineState.ImageGenReady -> InfoBanner(
-                    text = "Image generator ready: ${activeName ?: "model"} — type /draw <prompt> in any chat",
+                    text = "Image generator ready: ${activeImgGenId ?: "flux"} — type /draw <prompt> in any chat",
                     icon = Icons.Default.Image,
                     color = MaterialTheme.colorScheme.secondaryContainer
                 )
@@ -141,25 +143,18 @@ fun ModelsPanel(onClose: (() -> Unit)? = null) {
                     color = MaterialTheme.colorScheme.primaryContainer
                 )
                 else -> InfoBanner(
-                    text = "No model loaded. Pick one below to get started.",
+                    text = "Pick a model below to get started.",
                     icon = Icons.Default.Info,
                     color = MaterialTheme.colorScheme.surfaceVariant
                 )
             }
 
-            Text(
-                "Available models",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(top = 4.dp, start = 4.dp)
+            // ── SECTION 1: ON-DEVICE TEXT LLMs ─────────────────────────
+            SectionHeader(
+                title = "Text LLMs (on-device)",
+                subtitle = "Downloaded once, runs fully offline. The recommended option works on most phones."
             )
-            Text(
-                "Models are downloaded once and stored on your device. The recommended option works on most phones.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 4.dp)
-            )
-
-            ModelCatalog.ALL.forEach { spec ->
+            ModelCatalog.LLM_MODELS.forEach { spec ->
                 val cardState: DownloadState = downloadStates[spec.id] ?: DownloadState.Idle
                 ModelCard(
                     spec = spec,
@@ -177,13 +172,51 @@ fun ModelsPanel(onClose: (() -> Unit)? = null) {
                 )
             }
 
+            // ── SECTION 2: CLOUD VISION MODELS (v1.4.7) ────────────────
+            SectionHeader(
+                title = "Vision models (cloud)",
+                subtitle = "Answer questions about attached images. No download — runs on HuggingFace's free tier. Requires internet. The active model answers your question; if it's cold-starting, the others are tried automatically as fallbacks."
+            )
+            ModelCatalog.VISION_MODELS.forEach { spec ->
+                ModelCard(
+                    spec = spec,
+                    isActive = activeVisionId == spec.id,
+                    downloadState = DownloadState.Idle,
+                    isDownloaded = vm.isDownloaded(spec),
+                    combinedState = combinedState,
+                    onDownload = { /* cloud — no download */ },
+                    onActivate = { scope.launch { vm.activate(spec) } },
+                    onUnload = { scope.launch { vm.delete(spec) } },
+                    onDelete = { scope.launch { vm.delete(spec) } }
+                )
+            }
+
+            // ── SECTION 3: CLOUD IMAGE GENERATION MODELS (v1.4.7) ──────
+            SectionHeader(
+                title = "Image generation models (cloud)",
+                subtitle = "Power the /draw <prompt> command in any chat. No download — runs on Pollinations.ai (free). Requires internet. Pick a default; per-draw flags like --turbo or --wide still override."
+            )
+            ModelCatalog.IMAGE_GEN_MODELS.forEach { spec ->
+                ModelCard(
+                    spec = spec,
+                    isActive = activeImgGenId == spec.id,
+                    downloadState = DownloadState.Idle,
+                    isDownloaded = vm.isDownloaded(spec),
+                    combinedState = combinedState,
+                    onDownload = { /* cloud — no download */ },
+                    onActivate = { scope.launch { vm.activate(spec) } },
+                    onUnload = { scope.launch { vm.delete(spec) } },
+                    onDelete = { scope.launch { vm.delete(spec) } }
+                )
+            }
+
             Spacer(Modifier.height(16.dp))
             ImageGenTestCard()
             Spacer(Modifier.height(8.dp))
             Text(
-                "Image generation is built in — type /draw <prompt> in any chat. " +
-                    "It uses Pollinations.ai (cloud, free, no API key). " +
-                    "Requires internet.",
+                "Tip: image generation also supports per-draw flags — try " +
+                    "/draw --turbo wide: a landscape at sunset, or " +
+                    "/draw --realism: a portrait of an old fisherman.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -227,6 +260,19 @@ fun ModelsPanel(onClose: (() -> Unit)? = null) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SectionHeader(title: String, subtitle: String) {
+    Column(modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp)) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(2.dp))
+        Text(
+            subtitle,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -313,7 +359,9 @@ private fun ModelCard(
     onUnload: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val isCloud = spec.modelType == ModelType.IMAGE_GEN || spec.modelType == ModelType.VISION
     val isImageGen = spec.modelType == ModelType.IMAGE_GEN
+    val isVision = spec.modelType == ModelType.VISION
     val isLoading = combinedState is CombinedEngineState.LlmLoading ||
         combinedState is CombinedEngineState.ImageGenLoading
     Card(
@@ -326,7 +374,11 @@ private fun ModelCard(
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    if (isImageGen) Icons.Default.Image else Icons.Default.Memory,
+                    when {
+                        isImageGen -> Icons.Default.Image
+                        isVision -> Icons.Default.Visibility
+                        else -> Icons.Default.Memory
+                    },
                     null,
                     tint = MaterialTheme.colorScheme.primary
                 )
@@ -339,16 +391,24 @@ private fun ModelCard(
                 }
                 if (isImageGen) {
                     Spacer(Modifier.width(6.dp))
-                    AssistChip(onClick = {}, label = { Text("Image") },
-                        leadingIcon = { Icon(Icons.Default.Image, null, modifier = Modifier.size(14.dp)) })
+                    AssistChip(onClick = {}, label = { Text("Cloud") },
+                        leadingIcon = { Icon(Icons.Default.Cloud, null, modifier = Modifier.size(14.dp)) })
+                }
+                if (isVision) {
+                    Spacer(Modifier.width(6.dp))
+                    AssistChip(onClick = {}, label = { Text("Cloud") },
+                        leadingIcon = { Icon(Icons.Default.Cloud, null, modifier = Modifier.size(14.dp)) })
                 }
             }
             Spacer(Modifier.height(4.dp))
             Text(spec.description, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(6.dp))
+            // v1.4.7: Cloud models show "Cloud · requires internet" instead
+            // of the size/RAM line (which would say "0 MB · 0 MB" — useless).
             Text(
-                "Size: ${spec.sizeMb} MB · RAM: ${spec.ramMb} MB",
+                if (isCloud) "Cloud · requires internet"
+                else "Size: ${spec.sizeMb} MB · RAM: ${spec.ramMb} MB",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -356,12 +416,29 @@ private fun ModelCard(
             Spacer(Modifier.height(12.dp))
 
             // Action button — depends on state
+            // v1.4.7: Cloud models skip the Download / Downloading / Error
+            // states entirely (they have nothing to download). They go
+            // straight to Activate / Unload.
             when {
                 isActive -> {
                     OutlinedButton(onClick = onUnload, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.PowerSettingsNew, null)
                         Spacer(Modifier.width(6.dp))
-                        Text("Unload model")
+                        Text(if (isCloud) "Clear selection" else "Unload model")
+                    }
+                }
+                isCloud -> {
+                    // Cloud model that's not active — show Activate button
+                    Button(onClick = onActivate, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.PlayArrow, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            when (spec.modelType) {
+                                ModelType.VISION -> "Set as vision model"
+                                ModelType.IMAGE_GEN -> "Set as image generator"
+                                ModelType.LLM -> "Load model"
+                            }
+                        )
                     }
                 }
                 isLoading -> {
@@ -399,7 +476,7 @@ private fun ModelCard(
                         Button(onClick = onActivate, modifier = Modifier.weight(1f)) {
                             Icon(Icons.Default.PlayArrow, null)
                             Spacer(Modifier.width(6.dp))
-                            Text(if (isImageGen) "Load image model" else "Load model")
+                            Text("Load model")
                         }
                         OutlinedButton(onClick = onDelete) {
                             Icon(Icons.Default.Delete, null)

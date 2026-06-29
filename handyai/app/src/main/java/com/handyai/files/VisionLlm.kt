@@ -102,8 +102,14 @@ class VisionLlm(private val context: Context) {
 
     /**
      * VLM models tried in order. See class kdoc for the rationale.
+     *
+     * v1.4.7: This is the FALLBACK chain used when no preferred model is
+     * supplied to [ask]. The user's pick on the Models page is passed as
+     * `preferredModelId` and tried FIRST — if it succeeds, we use it. If
+     * it cold-starts past retries, we fall through to this list (skipping
+     * the already-tried preferred model).
      */
-    private val vlmModels = listOf(
+    private val defaultFallbackModels = listOf(
         "meta-llama/Llama-3.2-11B-Vision-Instruct",
         "llava-hf/llava-v1.6-mistral-7b-hf",
         "llava-hf/llava-1.5-7b-hf"
@@ -114,11 +120,20 @@ class VisionLlm(private val context: Context) {
      * answer from the VLM, or null if all models failed (caller should
      * fall back to the caption+OCR pipeline).
      *
+     * v1.4.7: [preferredModelId] is the HuggingFace model id (cloudModelId
+     * from the active ModelSpec). When non-null, it's tried first; the
+     * default fallback chain is appended (deduped) so we still succeed if
+     * the user's preferred model is cold-starting.
+     *
      * The question is wrapped with a brief system instruction so even
      * models without a strong system-prompt capability (LLaVA 1.5) get
      * the "answer the user's question about the image" framing.
      */
-    suspend fun ask(uri: Uri, question: String): String? = withContext(Dispatchers.IO) {
+    suspend fun ask(
+        uri: Uri,
+        question: String,
+        preferredModelId: String? = null
+    ): String? = withContext(Dispatchers.IO) {
         if (question.isBlank()) return@withContext null
 
         // 1. Load + downscale the bitmap. VLMs handle ~768px images well;
@@ -138,11 +153,20 @@ class VisionLlm(private val context: Context) {
         // 3. Build the OpenAI-style multimodal chat payload.
         val payload = buildPayload(question, dataUrl)
 
-        // 4. Try each VLM model in order with cold-start retries.
-        for (modelId in vlmModels) {
+        // 4. Build the ordered list of models to try: preferred first
+        //    (if any), then the default fallback chain (deduped).
+        val orderedModels = buildList {
+            if (!preferredModelId.isNullOrBlank()) add(preferredModelId)
+            defaultFallbackModels.forEach { m ->
+                if (m != preferredModelId) add(m)
+            }
+        }
+
+        // 5. Try each VLM model in order with cold-start retries.
+        for (modelId in orderedModels) {
             val answer = tryVlmCall(modelId, payload)
             if (!answer.isNullOrBlank()) {
-                if (modelId != vlmModels.first()) {
+                if (modelId != orderedModels.first()) {
                     android.util.Log.i(TAG, "VLM answer from backup model: $modelId")
                 }
                 return@withContext answer

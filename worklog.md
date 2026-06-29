@@ -1534,3 +1534,67 @@ Stage Summary:
 - On-device vision is richer: countable objects with spatial positions + scene labels + OCR text — gives the LLM concrete material to describe images even when cloud is offline.
 - Pending: push to origin/main with user-provided PAT (ghp_***).
 - Pending: scan-log scroll-lock during streaming, alternative free search APIs, local-rule web-browse trigger (these were also in the v1.4.5 brief but the user's latest message focuses on vision).
+
+---
+Task ID: v1.4.7-models-page-vision-and-imagegen
+Agent: Super Z (main)
+Task: Add vision and image generation models to the Models page as first-class model cards (not invisible cloud features). User clarification: "no, i want vision and image generation models on models page".
+
+Work Log:
+- Investigated ModelSettingsScreen.kt + ModelSettingsViewModel.kt + ModelCatalog.kt + SettingsRepository.kt + ModelAutoLoader.kt + ChatViewModel.kt to understand current Models-page architecture.
+- Found: image gen was a hidden cloud feature accessed only via /draw; vision was an automatic cloud pipeline with no model picker. Neither appeared on the Models page.
+- Added ModelType.VISION to the enum (alongside LLM + IMAGE_GEN).
+- Added `cloudModelId` field to ModelSpec — stores the HuggingFace model id (VISION) or Pollinations model id (IMAGE_GEN) sent to the API.
+- Extended ModelCatalog.ALL with 3 vision models:
+    * vision-llama-3.2-11b  (Llama 3.2 11B Vision — recommended, strongest)
+    * vision-llava-1.6-mistral (LLaVA 1.6 Mistral 7B — balanced)
+    * vision-llava-1.5-7b   (LLaVA 1.5 7B — lightweight fallback)
+- Extended ModelCatalog.ALL with 5 image-gen models:
+    * imggen-flux         (Flux default — recommended)
+    * imggen-flux-realism (photorealistic)
+    * imggen-turbo        (fast, lower quality)
+    * imggen-flux-anime   (anime style)
+    * imggen-flux-3d      (3D render style)
+- Added catalog helpers: LLM_MODELS, VISION_MODELS, IMAGE_GEN_MODELS filtered lists.
+- Added SettingsRepository keys: ACTIVE_VISION_MODEL_ID, ACTIVE_IMGGEN_MODEL_ID + their Flows + setActiveVisionModel() / setActiveImgGenModel() setters.
+- Created VisionLlm.kt — true cloud multimodal VLM via HuggingFace Inference API (chat-completions endpoint, OpenAI-style multimodal payload: text + image_url with data:image/jpeg;base64,...).
+  * 3-model fallback chain with cold-start retry (up to 2 retries per model, sleeps estimated_time capped at 25s).
+  * ask() accepts preferredModelId — user's pick from Models page is tried first; defaults chain is appended (deduped) so cold-start on the preferred model still succeeds via fallback.
+  * Read timeout 45s (VLMs are slower than captioners).
+- Updated ModelSettingsViewModel:
+  * Added activeVisionModelId / activeImgGenModelId StateFlows.
+  * activate() now dispatches by model type: LLM → file load, VISION → persist selection, IMAGE_GEN → persist selection + push cloudModelId to ImageGenEngine.
+  * isDownloaded() returns true for cloud models (no file to download).
+  * delete() handles cloud models by clearing the user's selection (no engine state to clear).
+  * unload() also clears cloud-model selections.
+- Updated ModelSettingsScreen.kt:
+  * Split the single flat "Available models" section into three labeled sections: "Text LLMs (on-device)", "Vision models (cloud)", "Image generation models (cloud)".
+  * ModelCard now distinguishes three types with distinct icons (Memory / Visibility / Image) and a "Cloud" chip for cloud models.
+  * Cloud models skip the Download / Downloading / Error states entirely — they go straight to Activate / Clear selection.
+  * Cloud models show "Cloud · requires internet" instead of "Size: 0 MB · RAM: 0 MB".
+  * Activate button label varies by type: "Load model" (LLM), "Set as vision model" (VISION), "Set as image generator" (IMAGE_GEN).
+  * Status banner now distinguishes "Active LLM" vs "Image generator ready" (with the active cloud model id).
+- Updated ImageGenEngine:
+  * Added @Volatile activeModelId field + setActiveModelId() / activeModelId() methods.
+  * generateWithOptions() resolves effective model: per-draw flag (--turbo etc.) > Models-page selection > "flux" fallback.
+  * Added ImageGenOptions data class with flag parser (--turbo, --realism, --anime, --3d, --enhance, --wide, --tall, --square, --size WxH).
+- Updated ChatViewModel:
+  * Added `visionLlm: VisionLlm` constructor parameter (wired through ChatViewModelFactory + HandyAiApp.visionLlm + MainScreen.kt).
+  * Added `pendingImageUri` field set by attachFile() when an image is attached.
+  * Added VisionLlm fast path in sendUserMessage(): if image attached + internet ON + pendingImageUri != null, try VisionLlm.ask() first; on success persist as assistant message and return; on null (cold-start/network error) silently fall back to the existing caption+OCR inline pipeline.
+  * Added tryVisionLlm() helper that reads the active vision model id from settings and resolves it to a cloudModelId.
+- Updated ModelAutoLoader:
+  * autoLoad() now accepts an optional ImageGenEngine parameter and restores the active cloud image-gen model on app launch (so /draw uses the user's pick without a restart).
+- Updated HandyAiApp:
+  * Added `visionLlm` lazy singleton.
+  * Passed imageGenEngine to ModelAutoLoader.autoLoad().
+- Bumped version 1.4.6 → 1.4.7 (versionCode 39 → 40).
+- Verified compile + KSP pass cleanly with JAVA_HOME=/home/z/jdk.
+
+Stage Summary:
+- Models page now shows three sections: Text LLMs (downloadable .task files), Vision models (cloud VLMs — no download), Image generation models (cloud Pollinations — no download).
+- Picking a vision model: stored in settings; ChatViewModel reads it and passes the cloudModelId to VisionLlm.ask() as the preferred model (with fallback to the other two on cold-start).
+- Picking an image-gen model: stored in settings + immediately pushed to ImageGenEngine; /draw uses it. Per-draw flags (--turbo etc.) still override.
+- Vision LLM fast path: image attached + internet ON → cloud VLM answers the user's question directly (natural-language answer, not just a caption). Falls back silently to caption+OCR inline pipeline if all VLMs fail.
+- compileDebugKotlin + kspDebugKotlin both pass.
+- 1 commit ahead of origin/main; push pending.

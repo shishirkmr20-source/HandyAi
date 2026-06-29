@@ -89,6 +89,32 @@ class ImageGenEngine(private val context: Context) {
     val state: StateFlow<ImageGenState> = _state.asStateFlow()
 
     /**
+     * v1.4.7: The user's chosen default Pollinations model id (e.g.
+     * "flux", "flux-realism", "turbo"). Set from the Models page via
+     * [setActiveModelId]. When null/blank, defaults to "flux".
+     *
+     * Volatile — read on the IO thread, written from the UI thread.
+     * No synchronization needed because Pollinations endpoints are
+     * stateless; a torn read just falls back to "flux" for one call.
+     */
+    @Volatile
+    private var activeModelId: String = "flux"
+
+    /**
+     * v1.4.7: Set the default image-gen model. Called by
+     * ModelSettingsViewModel.activate() when the user picks an IMAGE_GEN
+     * model from the Models page. The id is the catalog ModelSpec.id,
+     * which we map to the Pollinations model id via ModelCatalog.
+     */
+    fun setActiveModelId(cloudModelId: String) {
+        activeModelId = cloudModelId.ifBlank { "flux" }
+        android.util.Log.i(TAG, "Active image-gen model set to '$activeModelId'")
+    }
+
+    /** v1.4.7: Returns the currently-active Pollinations model id. */
+    fun activeModelId(): String = activeModelId
+
+    /**
      * Shared OkHttp client. Configured with generous timeouts because
      * Pollinations generation can take 10-20 seconds under load.
      * Follows redirects (Pollinations sometimes 302s to a CDN URL).
@@ -141,10 +167,24 @@ class ImageGenEngine(private val context: Context) {
      *   - "turbo"        — fastest (~3-5s), lower quality
      *
      * Aspect ratio presets are encoded as (width, height) pairs.
+     *
+     * v1.4.7: When [opts].model is the default "flux" AND the user has
+     * picked a different model on the Models page, the user's pick wins.
+     * Per-draw flags (--turbo etc.) still override the Models-page default.
      */
     suspend fun generateWithOptions(prompt: String, opts: ImageGenOptions): Result<String> = withContext(Dispatchers.IO) {
         if (prompt.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Prompt is empty"))
+        }
+
+        // v1.4.7: Resolve the effective model. Per-draw flags (opts.model
+        // explicitly set to something other than the catalog default "flux")
+        // take priority. Otherwise, use the Models-page selection. Fall
+        // back to "flux" if neither is set.
+        val effectiveModel = when {
+            opts.model != "flux" -> opts.model  // per-draw override
+            activeModelId.isNotBlank() -> activeModelId  // Models-page default
+            else -> "flux"  // hard fallback
         }
 
         _state.value = ImageGenState.Generating
@@ -158,7 +198,7 @@ class ImageGenEngine(private val context: Context) {
             // a fresh seed typically succeeds.
             var lastError: Throwable? = null
             for (attempt in 1..MAX_ATTEMPTS) {
-                Log.i(TAG, "Attempt $attempt/$MAX_ATTEMPTS for prompt (${prompt.length} chars) model=${opts.model} size=${opts.width}x${opts.height}")
+                Log.i(TAG, "Attempt $attempt/$MAX_ATTEMPTS for prompt (${prompt.length} chars) model=$effectiveModel size=${opts.width}x${opts.height}")
                 val attemptSeed = seed + attempt  // vary seed to bypass cache on retry
 
                 val urlStr = buildString {
@@ -167,7 +207,7 @@ class ImageGenEngine(private val context: Context) {
                     append("&height=").append(opts.height)
                     append("&nologo=true")
                     append("&seed=").append(attemptSeed)
-                    append("&model=").append(opts.model)
+                    append("&model=").append(effectiveModel)
                     if (opts.enhance) append("&enhance=true")
                 }
 

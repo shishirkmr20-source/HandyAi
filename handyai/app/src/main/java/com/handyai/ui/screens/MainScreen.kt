@@ -607,7 +607,8 @@ private fun ChatPane(
             habitRepo = app.habitRepository,
             summarizer = app.attachmentSummarizer,
             preferenceLearner = app.preferenceLearner,
-            contextCache = app.contextCache
+            contextCache = app.contextCache,
+            visionLlm = app.visionLlm
         )
     )
 

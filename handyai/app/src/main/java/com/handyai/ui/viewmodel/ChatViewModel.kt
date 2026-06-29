@@ -47,6 +47,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.first
 
 class ChatViewModel(
     private val chatId: Long,
@@ -116,6 +117,21 @@ class ChatViewModel(
      * sendUserMessage / handleMapReduceSummary).
      */
     private var currentGenJob: Job? = null
+
+    /**
+     * v1.4.7: The Uri of the most recently attached image. Set by
+     * attachFile() when an image is attached; consumed by the VisionLlm
+     * fast path in sendUserMessage(). Null when no image is pending or
+     * after it's been consumed.
+     *
+     * Lifecycle: attach → user sends message → VisionLlm consumes → null.
+     * If the user attaches an image but never sends a message about it,
+     * the Uri is leaked here until the next attach or app restart —
+     * acceptable since attachFile is per-chat and the Uri is just a
+     * content:// reference (no bitmap in memory).
+     */
+    @Volatile
+    private var pendingImageUri: Uri? = null
 
     /**
      * Stop the in-flight LLM generation (if any).
@@ -208,6 +224,16 @@ class ChatViewModel(
             android.util.Log.i("HandyAi/ChatVM",
                 "attachFile: extracted ${result.text.length} chars, label=$label, setting context on chatId=$chatId")
             chatRepo.setContext(chatId, result.text, label)
+
+            // v1.4.7: Remember the image Uri so the VisionLlm fast path
+            // in sendUserMessage() can pass it to VisionLlm.ask(). Only
+            // set when the attachment is actually an image — document
+            // attachments don't benefit from the VLM path.
+            if (label.startsWith("image:")) {
+                pendingImageUri = uri
+                android.util.Log.i("HandyAi/ChatVM",
+                    "attachFile: image detected — pendingImageUri set for VisionLlm fast path")
+            }
 
             // Detect parse failures. The extractor wraps errors in
             // "[FORMAT parse error: ...]" markers so the LLM can still
@@ -398,11 +424,45 @@ class ChatViewModel(
         //      re-attach the file if they want another Q about it).
         val fileContext: Pair<String, Boolean>? = fileContextSnapshot
 
-        // v1.4.5: Vision-model dispatch REMOVED. The LiteRT-LM runtime
-        // (FastVLM) is gone — image attachments now flow through the regular
-        // text-LLM path with the image's analyzed content (ML Kit OCR +
-        // labels + cloud BLIP-large caption + OCR.space fallback) inlined
-        // into the user's message by buildInlineUserMessage below.
+        // v1.4.7: VISION LLM FAST PATH
+        //
+        // When the user attaches an image AND has internet enabled AND the
+        // active vision model is set (or we can use the default), route the
+        // question through VisionLlm — a real multimodal VLM that takes the
+        // image + the user's question and returns a natural-language ANSWER
+        // (not just a caption). This is far more capable than the caption +
+        // OCR pipeline inlined into the text-LLM's prompt.
+        //
+        // Trigger conditions:
+        //   - fileContext.second == true (it's an image, not a document)
+        //   - internetEnabled.value == true (VLM is cloud-only)
+        //   - text doesn't look like "/draw" (image-gen already handled)
+        //
+        // Failure handling: if the VLM call returns null (all models cold-
+        // starting or network error), we silently fall through to the
+        // existing caption+OCR-inline pipeline. The user never sees an error
+        // — they just get the lower-quality fallback answer.
+        //
+        // We also keep the original image Uri around (stored when
+        // attachFile() runs) so we can pass it to VisionLlm.ask().
+        if (fileContext != null && fileContext.second &&
+            internetEnabled.value && pendingImageUri != null
+        ) {
+            val vlmResult = tryVisionLlm(pendingImageUri!!, text)
+            if (vlmResult != null) {
+                android.util.Log.i("HandyAi/ChatVM",
+                    "VisionLlm succeeded (${vlmResult.length} chars) — using VLM answer")
+                chatRepo.appendMessage(chatId, Role.ASSISTANT, vlmResult)
+                pendingImageUri = null  // consume
+                return@launch
+            }
+            android.util.Log.i("HandyAi/ChatVM",
+                "VisionLlm returned null — falling back to inline caption+OCR pipeline")
+        }
+        // Consume the pending image Uri even if we didn't use the VLM path
+        // (no internet, or VLM failed) so it doesn't leak to a later
+        // unrelated message.
+        pendingImageUri = null
 
         // 3.55) MAP-REDUCE SUMMARIZATION FOR LARGE FILES
         //
@@ -1032,6 +1092,40 @@ class ChatViewModel(
         val match = prefixes.firstOrNull { lower.startsWith(it) } ?: return null
         val prompt = trimmed.substring(match.length).trim()
         return prompt.ifBlank { null }
+    }
+
+    /**
+     * v1.4.7: Try answering the user's question about an attached image
+     * using the cloud multimodal VLM selected on the Models page.
+     *
+     * Reads the active vision model id from settings, resolves it to a
+     * ModelSpec (for the cloudModelId to pass to VisionLlm), and calls
+     * VisionLlm.ask(). Returns the VLM's answer, or null on any failure
+     * (cold-start past retries, network error, etc.) so the caller can
+     * fall back to the inline caption+OCR pipeline.
+     *
+     * This runs in a NonCancellable context because the VLM call can take
+     * 10-30s on cold-start — we don't want a stray Stop tap to abort the
+     * HTTP request midway (which would waste the work and produce no
+     * answer at all). The user can still cancel future tokens via the
+     * normal streaming path.
+     */
+    private suspend fun tryVisionLlm(imageUri: Uri, question: String): String? {
+        return try {
+            _statusText.value = "Asking vision model… (cloud, 5–30 seconds)"
+            val savedId = settings.activeVisionModelId.first()
+            val preferredCloudId = savedId?.let { id ->
+                com.handyai.llm.ModelCatalog.byId(id)?.takeIf {
+                    it.modelType == com.handyai.llm.ModelType.VISION
+                }?.cloudModelId
+            }
+            visionLlm.ask(imageUri, question, preferredCloudId)
+        } catch (t: Throwable) {
+            android.util.Log.w("HandyAi/ChatVM", "tryVisionLlm failed: ${t.message}")
+            null
+        } finally {
+            _statusText.value = ""
+        }
     }
 
     /**
