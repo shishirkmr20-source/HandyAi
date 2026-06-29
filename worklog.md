@@ -1438,3 +1438,28 @@ Next actions (for the implementing agent)
   7. DEFER: table-block integration (Finding 2C), collapsible `<thought>` (Finding 2D), apply bold/heading parsing to user messages (Finding 2D).
 
 • No code was modified in this investigation (research-only task). All file:line references are accurate as of the current source state (post-v1.4.3, main at 243da8a).
+
+---
+Task ID: v1.4.4-fixes
+Agent: main
+Task: Fix (1) per-model speed, (2) web search regression, (3) markdown bold + headings, (4) SmolLM tag conversion. Build v1.4.4 APK and push.
+
+Work Log:
+- Read both investigation reports (investigate-speed-and-websearch, investigate-markdown-and-tags).
+- PER-MODEL SPEED: ChatViewModel.buildSmartSystemPrompt — extended the length nudge to ALL models. Previously the else branch returned "" (no nudge) for 1.5B+ models. Now: SmolLM→SHORT 1-3 sentences, Qwen 0.5B→concise, Qwen 1.5B→1-5 sentences no restating, Phi-4-mini→1-6 sentences lists only when asked, larger→direct answer preferred.
+- WEB SEARCH FIX: ChatViewModel — dropped the `routed.matchedRules.any { it.id == "web_search" }` gate so web search runs whenever internet is ON. The PromptRouter's web_search rule only matched freshness keywords ("latest", "news", "weather"), so common factual questions got no results even with internet on. This was the "used to work fine earlier" regression.
+- MARKDOWN BOLD + HEADINGS: MarkdownParser — added parseToAnnotatedString() that converts **bold** → bold span, ### heading → bold span. Safe because StreamingBubble's caret code uses lr.layoutInput.text.length (the layout's own text), not parsed.length. The v1.2.9 crash cannot recur.
+- SmolLM TAG CONVERSION: MarkdownParser — tryParseSmolLmTag() recognizes <thought>/<reasoning> → italic+dimmed, <answer>/<summary> → bold, <response>/<action>/<think>/<reflection>/<plan>/<output>/<result> → unwrapped. Tags are converted in the UI only; DB/TTS paths still strip tags via sanitize().
+- Added internal sanitizeBasic() — runs passes 2-4 without tag stripping, preserving tags for the display path.
+- MessageBubble: assistant text blocks now use parseToAnnotatedString for live formatting. User/error messages stay plain Text.
+- StreamingBubble (MainScreen): uses parseToAnnotatedString so formatting renders during streaming.
+- ChatViewModel: streaming buffer uses sanitizeBasic (tags preserved); DB persist uses sanitize (tags stripped).
+- Bumped version: 1.4.3 → 1.4.4 (versionCode 36 → 37).
+- Built release APK: BUILD SUCCESSFUL in 57s.
+- Copied 127 MB APK to /home/z/my-project/download/handyai-v1.4.4-apk/app-release.apk.
+- Pushed to GitHub: origin/main now at de8ecf5.
+
+Stage Summary:
+- 4 issues fixed across 5 files: ChatViewModel.kt, MarkdownParser.kt, MessageBubble.kt, MainScreen.kt, build.gradle.kts, SettingsScreen.kt.
+- v1.4.4 APK (127 MB) at /home/z/my-project/download/handyai-v1.4.4-apk/app-release.apk.
+- GitHub: main now at de8ecf5.

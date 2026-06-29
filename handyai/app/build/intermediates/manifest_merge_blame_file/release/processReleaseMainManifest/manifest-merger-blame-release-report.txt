@@ -1,8 +1,8 @@
 1<?xml version="1.0" encoding="utf-8"?>
 2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
 3    package="com.handyai"
-4    android:versionCode="36"
-5    android:versionName="1.4.3" >
+4    android:versionCode="37"
+5    android:versionName="1.4.4" >
 6    <!--
 7 LiteRT-LM (vision models like FastVLM) declares minSdk 31 in its
 8         AndroidManifest. Our app supports Android 8+ (minSdk 26). This
