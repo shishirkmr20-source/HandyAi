@@ -93,14 +93,16 @@ object ModelAutoLoader {
                 // can't load each other's files.
                 val isLitertlm = savedPath.endsWith(".litertlm", ignoreCase = true)
                 if (isLitertlm) {
-                    if (liteRtlm.isModelLoaded()) {
-                        Log.i(TAG, "LiteRT-LM model already loaded — skipping.")
-                        return@launch
-                    }
-                    Log.i(TAG, "Auto-loading LiteRT-LM model: $savedPath (${file.length()} bytes)")
-                    val result = liteRtlm.setActiveModel(savedPath)
-                    result.onSuccess { Log.i(TAG, "LiteRT-LM auto-load succeeded.") }
-                        .onFailure { err -> Log.e(TAG, "LiteRT-LM auto-load failed.", err) }
+                    // ── v1.4.3: skip auto-loading .litertlm models ─────────
+                    // LiteRT-LM alpha05 crashes natively in eng.initialize()
+                    // on arm64-v8a. If we auto-load here, the app crashes on
+                    // every launch until the user manually clears the saved
+                    // model path. Instead, silently clear the saved path and
+                    // let the user pick a text model from the Models screen.
+                    Log.w(TAG, "Saved model is .litertlm (vision) — skipping auto-load " +
+                        "(LiteRT-LM alpha05 native crash). Clearing saved path.")
+                    settings.setActiveModel(null, null)
+                    return@launch
                 } else {
                     if (llm.isModelLoaded()) {
                         Log.i(TAG, "MediaPipe model already loaded — skipping.")

@@ -138,6 +138,18 @@ class ChatViewModel(
         // Main (a dispatcher round-trip that makes Stop feel sluggish).
         llm.markReady()
         liteRtlm.markReady()
+        // ── v1.4.3: CLEAR STREAMING CHUNK SYNCHRONOUSLY ──────────────
+        // Previously, _streamingChunk was only cleared at the END of the
+        // sendUserMessage coroutine (line 619). But that coroutine is now
+        // being cancelled, so the clearing never runs until the catch
+        // block finishes — and the abandoned ProgressListener keeps
+        // appending to _streamingChunk for a second or two, making the
+        // streaming bubble linger and fill with text/newlines.
+        // Clear it HERE, BEFORE job.cancel(), so the bubble vanishes the
+        // instant the user taps Stop. The engine-side listener guard
+        // (LlmEngine v1.4.3) prevents further appends even if a token
+        // arrives mid-cancel.
+        _streamingChunk.value = ""
         job.cancel()
     }
 
@@ -545,11 +557,19 @@ class ChatViewModel(
             history = effectiveHistory,
             systemPrompt = systemPrompt
         ) { chunk ->
-            // Sanitize each chunk: small models sometimes emit the literal
-            // 2-char sequence "\" + "n" instead of an actual newline. We
-            // convert those to real newlines so the streaming bubble and
-            // the persisted message both render cleanly.
-            _streamingChunk.value += com.handyai.ui.components.MarkdownParser.sanitize(chunk)
+            // ── v1.4.3: RE-SANITIZE THE FULL BUFFER PER CHUNK ──────────
+            // Previously we appended `sanitize(chunk)` to the buffer.
+            // Problem: the newline-collapse rule in sanitize needs to see
+            // the WHOLE buffer to collapse runs of 3+ newlines — chunk-
+            // boundary splits let "\n\n\n" slip through when the newlines
+            // arrive in different chunks.
+            //
+            // Fix: append the raw chunk, sanitize the WHOLE buffer, and
+            // store the sanitized result. This is O(n) per chunk but n is
+            // typically <2KB (a single response), so the cost is negligible.
+            _streamingChunk.value = com.handyai.ui.components.MarkdownParser.sanitize(
+                _streamingChunk.value + chunk
+            )
         }
 
         // 6) Persist assistant message
@@ -575,7 +595,7 @@ class ChatViewModel(
         } else {
             kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
                 result.onSuccess { full ->
-                    val sanitized = com.handyai.ui.components.MarkdownParser.sanitize(full)
+                    val sanitized = com.handyai.ui.components.MarkdownParser.sanitize(full).trimEnd()
                     val final = if (sanitized.isBlank()) partial.ifBlank { "(empty response)" } else sanitized
                     chatRepo.appendMessage(chatId, Role.ASSISTANT, final)
                     if (ttsEnabled.value) {
@@ -583,7 +603,7 @@ class ChatViewModel(
                     }
                 }.onFailure { err ->
                     if (isCancellation && partial.isNotBlank()) {
-                        chatRepo.appendMessage(chatId, Role.ASSISTANT, partial)
+                        chatRepo.appendMessage(chatId, Role.ASSISTANT, partial.trimEnd())
                         android.util.Log.i("HandyAi/ChatVM",
                             "Generation stopped by user, persisted partial: ${partial.length} chars")
                     } else {

@@ -78,56 +78,30 @@ class ModelSettingsViewModel(
         try {
             when (spec.modelType) {
                 ModelType.VISION_LITERTLM -> {
-                    // LiteRT-LM alpha05 declares minSdk 31 (Android 12) in its
-                    // manifest. We use tools:overrideLibrary so the APK installs
-                    // on older Android, but the runtime will crash on activation
-                    // below API 31. Guard here with a friendly error instead.
-                    if (android.os.Build.VERSION.SDK_INT < 31) {
-                        val msg = "Vision models (FastVLM) require Android 12 or newer. " +
-                            "Your device is Android ${android.os.Build.VERSION.RELEASE} " +
-                            "(API ${android.os.Build.VERSION.SDK_INT}). " +
-                            "Use a text-only model (Qwen / Phi / SmolLM) instead — image " +
-                            "attachments will still work via on-device ML Kit OCR + labels."
-                        llm.surfaceError(msg)
-                        return@launch
-                    }
-                    // Pre-flight: verify the file exists and is non-trivial
-                    // before handing off to the native loader. A missing or
-                    // truncated file causes a native crash that bypasses
-                    // Java exception handling.
-                    val modelFile = java.io.File(path)
-                    if (!modelFile.exists() || modelFile.length() < 100 * 1024) {
-                        val msg = "Vision model file is missing or too small " +
-                            "(${modelFile.length()} bytes). Please delete and re-download."
-                        llm.surfaceError(msg)
-                        return@launch
-                    }
-                    // Unload the MediaPipe engine if a .task model was previously
-                    // active (the two engines can't run simultaneously without
-                    // eating ~5GB of RAM combined).
-                    if (llm.isModelLoaded()) {
-                        llm.unload()
-                    }
-                    // ── v1.4.2: extra defensive try-catch around the entire
-                    // LiteRT-LM activation. The native library can throw
-                    // UnsatisfiedLinkError or RuntimeException subclasses that
-                    // wouldn't be caught by the engine's internal try-catch
-                    // (they happen during class loading or native method
-                    // registration, before setActiveModel's body runs).
-                    val result = try {
-                        liteRtlm.setActiveModel(path)
-                    } catch (nativeErr: Throwable) {
-                        android.util.Log.e("HandyAi/ModelSettingsVM",
-                            "Vision model native activation threw", nativeErr)
-                        llm.surfaceError(nativeErr.message ?: nativeErr.javaClass.simpleName
-                            ?: "Vision model failed to load (native error)")
-                        return@launch
-                    }
-                    result.onSuccess {
-                        settings.setActiveModel(path, spec.displayName)
-                    }.onFailure { err ->
-                        llm.surfaceError(err.message ?: "Failed to activate vision model")
-                    }
+                    // ── v1.4.3: VISION MODELS TEMPORARILY DISABLED ───────────────
+                    // The LiteRT-LM alpha05 native runtime crashes with a
+                    // SIGSEGV inside `eng.initialize()` on arm64-v8a devices.
+                    // This is a NATIVE crash — it kills the process before
+                    // Java exception handling can run, so the v1.4.2 try-catch
+                    // defenses are useless against it.
+                    //
+                    // Rather than ship a crash, we surface a friendly error
+                    // and tell the user how to get image understanding today:
+                    // attach an image to a text-model chat — ML Kit OCR +
+                    // image labels feed the text model the image's content.
+                    //
+                    // This guard can be removed once LiteRT-LM ships a
+                    // version where `eng.initialize()` is stable on arm64.
+                    val msg = "Vision models (FastVLM) are temporarily disabled in this build — " +
+                        "the on-device runtime crashes natively on 64-bit devices. " +
+                        "To analyze an image, pick a text model (Qwen / Phi / SmolLM) and " +
+                        "attach the image — on-device ML Kit OCR + image labels give the " +
+                        "model the image's content automatically."
+                    llm.surfaceError(msg)
+                    android.util.Log.w("HandyAi/ModelSettingsVM",
+                        "Vision model activation blocked: LiteRT-LM alpha05 eng.initialize() " +
+                        "crashes natively on arm64-v8a. See worklog investigate-vlm-crash.")
+                    return@launch
                 }
                 ModelType.LLM -> {
                     // Unload the LiteRT-LM engine if a .litertlm model was

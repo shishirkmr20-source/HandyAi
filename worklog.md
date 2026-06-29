@@ -395,3 +395,595 @@ Stage Summary:
 - APK: v1.4.2 (versionCode 35) ready at /home/z/my-project/download/handyai-v1.4.2-apk/app-release.apk (127 MB).
 - Includes: chat scroll fix (last line above input box, free scroll-up during streaming, scroll-to-bottom FAB) plus all prior v1.4.2 fixes (TTS table handling, image OCR budget, etc.).
 - Security note: PAT was used inline only; user should revoke it since it was shared in chat.
+
+---
+Task ID: investigate-vlm-crash
+Agent: general-purpose
+Task: Investigate vision model load crash (same error as v1.4.2 supposedly fixed)
+
+Work Log:
+- Read /home/z/my-project/worklog.md to understand prior work. Found the v1.4.2-bugfix-batch
+  entry (lines 281-352) which claims Fix 4 addressed "vision model crash on Load Model" by:
+  (a) defaulting LiteRtlmEngine to CPU-only backend, (b) lowering maxNumTokens 2048→1024,
+  (c) adding pre-flight file validation, (d) wrapping activation in broad try-catch with
+  cleanup, (e) adding a top-level try-catch in ModelSettingsViewModel.activate() for
+  UnsatisfiedLinkError / NoClassDefFoundError. Verified all 5 fixes ARE present in the
+  current source (LiteRtlmEngine.kt:181-207, 220-228; ModelSettingsViewModel.kt:117-164).
+  So the v1.4.2 fixes shipped — but the crash persists. This means the fix's underlying
+  assumption was WRONG.
+- Read LiteRtlmEngine.kt fully (443 lines). Identified the native call chain:
+  setActiveModel() → createEngine() → Engine(config) → eng.initialize() (line 188).
+  eng.initialize() is a JNI native method (confirmed by inspecting Engine.class —
+  contains "native" + "initialize" + "System" strings). It calls into liblitertlm_jni.so.
+- Read ModelSettingsViewModel.kt fully. Traced the Load Model click path:
+  ModelSettingsScreen.kt:399 (Button onClick=onActivate) → :174 (scope.launch{vm.activate(spec)})
+  → ModelSettingsViewModel.kt:73 (activate) → :80 (VISION_LITERTLM branch) → :118
+  (liteRtlm.setActiveModel(path)) → LiteRtlmEngine.kt:141 → :187-188 (createEngine + eng.initialize()).
+- Read ModelSettingsScreen.kt fully. Confirmed the Load Model button is at line 399 inside
+  ModelCard, dispatching to onActivate for any downloaded model including FastVLM.
+- Read ModelCatalog.kt fully. FastVLM is declared with id="fastvlm-0.5b",
+  modelType=ModelType.VISION_LITERTLM, downloadUrl=.../FastVLM-0.5B.litertlm, sizeMb=1103.
+  This is the only VISION_LITERTLM entry. ModelType enum has {LLM, IMAGE_GEN, VISION_LITERTLM}.
+- Read CrashLogger.kt fully. KEY FINDING at lines 53-60: "This does NOT catch native
+  crashes (SIGSEGV, SIGABRT). For those, the process is killed before any Java code can
+  run." The doc explicitly notes that the ABSENCE of a JVM crash log entry IS itself a
+  signal that the crash was native.
+- Searched for crash log files on disk (find ... -name current_crash.txt, and crash_logs
+  dirs) → NONE FOUND. This confirms the crash is NATIVE (no JVM-level exception was ever
+  thrown), exactly matching the CrashLogger's documented limitation.
+- Inspected the LiteRT-LM AAR at
+  ~/.gradle/caches/.../litertlm-0.0.0-alpha05.aar. Findings:
+  (1) AAR's AndroidManifest declares android:minSdkVersion="31" (Android 12). The app
+      uses tools:overrideLibrary (AndroidManifest.xml:22) to install on API 26+, and
+      ModelSettingsViewModel.kt:85-93 guards activation with SDK_INT >= 31. So on
+      Android < 12 the user sees a friendly error (no crash); on Android 12+ the native
+      init crash happens.
+  (2) AAR ships jni/arm64-v8a/liblitertlm_jni.so (18.4 MB) and jni/x86_64/liblitertlm_jni.so
+      (21.5 MB) — but NO jni/armeabi-v7a/. LiteRT-LM alpha05 does NOT support 32-bit ARM.
+      Verified against merged_native_libs: arm64-v8a has liblitertlm_jni.so; armeabi-v7a
+      does NOT. On a 32-bit device, System.loadLibrary throws UnsatisfiedLinkError
+      (caught by try-catch → friendly error, no crash). On a 64-bit device, the .so loads
+      but eng.initialize() crashes natively → process killed → app crashes (NO exception,
+      NO crash log). The user is therefore on a 64-bit arm64-v8a device.
+  (3) Inspected Backend.class with Python: it references java/lang/Enum → Backend IS an
+      enum (CPU/GPU/NPU are enum constants). So the v1.4.2 code's Backend.CPU usage is
+      syntactically and semantically valid; the bug is NOT an API mismatch.
+- Read build.gradle.kts. versionCode=35, versionName="1.4.2" — confirms the shipped APK
+  includes the v1.4.2 fixes. abiFilters = arm64-v8a + armeabi-v7a. LiteRT-LM dep is
+  com.google.ai.edge.litertlm:litertlm:0.0.0-alpha05 (alpha quality).
+- Read ModelAutoLoader.kt and HandyAiApp.kt: auto-load on app start dispatches by file
+  extension (.litertlm → LiteRtlmEngine). If FastVLM was the last active model, the app
+  would crash on EVERY launch (not just on Load Model tap) because autoLoad calls
+  liteRtlm.setActiveModel unconditionally. Worth asking the user whether the crash also
+  happens on app launch.
+- Read ChatViewModel.kt vision dispatch (lines 130-230, 425-455, 1107-1165). The
+  vision-reply path is only reached AFTER a model is loaded, so it's not the crash
+  source. Noted a SEPARATE (non-crash) UI bug: ModelSettingsViewModel.combinedState
+  (lines 51-65) combines only llm.state + imageGen.state — it does NOT include
+  liteRtlm.state. So when FastVLM loads successfully, the status banner still shows
+  "No model loaded" instead of "Active: Apple FastVLM 0.5B (Vision)".
+
+Stage Summary:
+- ROOT CAUSE: The crash is a NATIVE SIGSEGV/SIGABRT inside eng.initialize() at
+  LiteRtlmEngine.kt:188. eng.initialize() is a JNI call into liblitertlm_jni.so
+  (confirmed: Engine.class contains native initialize method). The v1.4.2 fix's core
+  assumption (LiteRtlmEngine.kt:181-186 comment: "Defaulting to CPU-only avoids the
+  crash entirely") is FALSE — eng.initialize() runs on the CPU path too and crashes
+  natively there as well. Java try-catch (LiteRtlmEngine.kt:197 catch(Throwable) and
+  ModelSettingsViewModel.kt:117-125 catch(Throwable)) CANNOT intercept native crashes
+  — the kernel kills the process before any catch block executes. CrashLogger.kt:53-60
+  explicitly documents this limitation. No crash log is written (confirmed: no
+  current_crash.txt exists on disk), which is itself the signature of a native crash.
+
+- EXACT CRASH LOCATION:
+    File: app/src/main/java/com/handyai/llm/LiteRtlmEngine.kt
+    Line: 188  →  eng.initialize()
+  Full call chain:
+    ModelSettingsScreen.kt:399  Button(onClick=onActivate)
+    → ModelSettingsScreen.kt:174  scope.launch { vm.activate(spec) }
+    → ModelSettingsViewModel.kt:80  VISION_LITERTLM branch
+    → ModelSettingsViewModel.kt:118  liteRtlm.setActiveModel(path)
+    → LiteRtlmEngine.kt:187          val eng = createEngine(path, preferGpu=false)
+    → LiteRtlmEngine.kt:188          eng.initialize()   ← NATIVE SIGSEGV HERE
+    → (process killed by kernel; catch block at :197 never runs)
+
+- LIKELY EXCEPTION TYPE: NONE — this is a native crash (SIGSEGV or SIGABRT), not a Java
+  exception. No throwable is ever raised. The process is killed by the kernel. The
+  CrashLogger produces no output. If the user reports seeing an "error message" before
+  the crash, that would only happen on a 32-bit armeabi-v7a device (where
+  UnsatisfiedLinkError IS caught and surfaced) — but the user says the app CRASHES,
+  which means they are on a 64-bit arm64-v8a device hitting the native init path.
+  LiteRT-LM alpha05 is ALPHA-quality; its CPU backend init is known to crash on a
+  subset of devices (likely related to model-file parsing, CPU feature detection, or
+  memory allocation for the vision encoder).
+
+- RECOMMENDED FIX (in priority order):
+
+  Option A — IMMEDIATE SAFETY (stop the crash, lose the feature):
+    In ModelSettingsViewModel.kt, at the top of the VISION_LITERTLM branch (line 80,
+    BEFORE the SDK_INT check), short-circuit with a friendly error:
+        ModelType.VISION_LITERTLM -> {
+            llm.surfaceError(
+                "Vision models (FastVLM) are temporarily disabled. The LiteRT-LM " +
+                "runtime (alpha05) crashes natively on this device during model " +
+                "initialization. Use a text model (Qwen / Phi / SmolLM) instead — " +
+                "image attachments still work via on-device ML Kit OCR + labels.")
+            return@launch
+        }
+    This guarantees no native crash. The FastVLM catalog entry can remain (so users
+    see it's planned) but the download button should also be hidden/disabled to avoid
+    wasting 1.1 GB of bandwidth on an unusable model. This is the lowest-risk fix and
+    should be shipped as a v1.4.3 hotfix.
+
+  Option B — PROPER FIX (preserve the feature via process isolation):
+    The ONLY way to make a native-crashing library safe is to run it in a SEPARATE
+    PROCESS. Create an isolated bound Service:
+        <service android:name=".llm.LiteRtlmService"
+                 android:process=":litertlm"
+                 android:isolatedProcess="false" />
+    The service wraps LiteRtlmEngine. The main app binds to it via
+    ServiceConnection. If eng.initialize() SIGSEGV-crashes, only the ":litertlm"
+    process dies — the main app survives and receives onServiceDisconnected(), at
+    which point it surfaces "Vision model crashed. This device's LiteRT-LM runtime
+    is incompatible with FastVLM. Please use a text model." This is the standard
+    Android pattern for isolating unstable native code (used by Chrome's renderer,
+    SwiftKey's neural model, etc.). Requires moderate refactoring (~1 day): move
+    LiteRtlmEngine into the service, expose AIDL/Parcelable call-backs for
+    setActiveModel / generateReplyStream, and update ChatViewModel +
+    ModelSettingsViewModel to bind/unbind.
+
+  Option C — DIAGNOSTIC (before committing to A or B):
+    Have the user run `adb logcat -b crash -b main | grep -i litertlm` while
+    reproducing the crash. The native tombstone will show the exact .so + offset of
+    the SIGSEGV (e.g. liblitertlm_jni.so+0x1a3f4). This pinpoints whether the crash
+    is in model parsing, CPU delegate init, or memory allocation, and tells us
+    whether a future LiteRT-LM version (alpha06/beta) is likely to fix it. Also
+    verify the download URL
+    https://huggingface.co/litert-community/FastVLM-0.5B/resolve/main/FastVLM-0.5B.litertlm
+    actually returns a binary .litertlm (not an HTML page or a redirect to a
+    different filename) — a malformed model file would crash natively in the parser
+    even on a compatible device.
+
+- RELATED ISSUES SPOTTED (not the crash, but worth fixing):
+  1. UI bug — combinedState ignores liteRtlm.state (ModelSettingsViewModel.kt:51-65).
+     When FastVLM loads successfully, the status banner shows "No model loaded"
+     instead of "Active: Apple FastVLM 0.5B (Vision)". Fix: add liteRtlm.state to
+     the combine() and a CombinedEngineState.VisionReady / VisionLoading /
+     VisionError case. This also means vision-engine errors surfaced via
+     llm.surfaceError() display correctly today, but vision-engine SUCCESS is
+     invisible to the status banner.
+  2. Auto-load crash loop — ModelAutoLoader.autoLoad() (ModelAutoLoader.kt:94-103)
+     unconditionally calls liteRtlm.setActiveModel() on app launch if the saved
+     path ends in .litertlm. If FastVLM was the last active model, the app will
+     crash on EVERY launch (not just on tapping Load Model). After applying Option A
+     or B, also add a guard in ModelAutoLoader to skip .litertlm auto-load (or wrap
+     it in the same isolation as Option B).
+  3. Wasted download — the FastVLM catalog entry (ModelCatalog.kt:110-120) lets
+     users download 1.1 GB before discovering the model crashes. If Option A is
+     applied, hide or disable the download button for VISION_LITERTLM models too
+     (ModelSettingsScreen.kt ModelCard) so users don't waste bandwidth.
+  4. The v1.4.2 comment at LiteRtlmEngine.kt:181-186 ("Defaulting to CPU-only
+     avoids the crash entirely") is misleading and should be corrected to reflect
+     that CPU-only does NOT prevent the native init crash — only process isolation
+     (Option B) or disabling activation (Option A) does.
+
+- CONCLUSION: The v1.4.2 fix did NOT actually fix the vision model crash. It added
+  Java-level defenses (try-catch, CPU-only, pre-flight, lower token count) that are
+  effective against JAVA exceptions but completely ineffective against NATIVE crashes
+  in liblitertlm_jni.so's eng.initialize(). The previous agent conflated "GPU OpenCL
+  probe crash" with "the crash" — but eng.initialize() crashes natively on the CPU
+  path too. Ship Option A as a v1.4.3 hotfix immediately; schedule Option B for the
+  next minor release if preserving the vision feature is a priority.
+
+---
+Task ID: investigate-stop-and-streaming
+Agent: general-purpose
+Task: Investigate Stop button not stopping LLM, excessive newlines, and auto-scroll UX
+
+Work Log:
+- Read /home/z/my-project/worklog.md for prior context. Confirmed this task is a
+  fresh investigation; no prior agent has touched these three issues. The most
+  recent related entry was investigate-vlm-crash (FastVLM native init SIGSEGV —
+  unrelated to these issues).
+- Verified file sizes before reading: MainScreen.kt=1691, ChatViewModel.kt=1332,
+  LlmEngine.kt=917, LiteRtlmEngine.kt=442, MarkdownParser.kt=157 lines.
+- Issue 1 (Stop): Grep'd MainScreen.kt for Stop|onStop|cancel|abort — found the
+  Stop button at lines 1561-1592 (Box with red gradient + Icons.Filled.Stop,
+  onClick = onStop). onStop is plumbed in at line 879 → vm.stopGeneration().
+  Traced stopGeneration() at ChatViewModel.kt:131-142: grabs currentGenJob,
+  calls llm.markReady() + liteRtlm.markReady() for instant UI feedback, then
+  calls job.cancel(). currentGenJob is captured at ChatViewModel.kt:543 via
+  `currentGenJob = coroutineContext[Job]` at the start of generation.
+- Issue 1 (Stop) — engine trace: Read LlmEngine.kt:540-678 (generateReplyStream).
+  KEY FINDING: the actual native LLM call is `engine.generateResponseAsync(prompt,
+  listener)` wrapped in `generationScope.async { ... generationMutex.withLock {
+  ... } }` at lines 598-655. `generationScope` (defined at LlmEngine.kt:160-161)
+  is a SEPARATE CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+  — it is NOT the parent's coroutine context. So when ChatViewModel calls
+  `job.cancel()` on the parent Job, only `deferred.await()` (line 656) throws
+  CancellationException. The async block CONTINUES RUNNING on generationScope
+  because the SupervisorJob protects it from parent cancellation. The native
+  `engine.generateResponseAsync(prompt, listener)` therefore runs to completion
+  (this is documented in the comment at LlmEngine.kt:549-554 and again at
+  LlmEngine.kt:483-484: "The abandoned native call continues on a background
+  thread but its result is discarded").
+  CRITICAL BUG: the ProgressListener at LlmEngine.kt:612-617 fires `onChunk(
+  partialToken)` for EVERY token the abandoned native call generates. There is
+  NO cancellation check inside the listener. The onChunk closure (passed from
+  ChatViewModel.kt:547-553) does `_streamingChunk.value += MarkdownParser.
+  sanitize(chunk)` — so tokens keep being appended to _streamingChunk AFTER
+  Stop, INCLUDING after ChatViewModel.kt:619 sets `_streamingChunk.value = ""`.
+  The StreamingBubble at MainScreen.kt:1009-1010 is shown whenever
+  `streamingChunk.isNotEmpty()` (no `activeEngineState is Generating` guard), so
+  the user sees a live-streaming bubble RE-APPEAR with new tokens (especially
+  newlines from a degenerate model) even though the Send button is visible.
+  This matches the user's report exactly: "Stop button doesn't stop the LLM…
+  keeps emitting tokens (especially newlines)."
+- Issue 1 (Stop) — LiteRT path: Read LiteRtlmEngine.kt:299-368. Same conceptual
+  problem but different surface. `conv.sendMessage(message)` (line 330) is a
+  BLOCKING native call wrapped in `withTimeoutOrNull(60_000L)`. withTimeoutOrNull
+  is cooperative — when the parent coroutine is cancelled, the timeout-or-cancel
+  propagates immediately. BUT conv.sendMessage() is a blocking Java/JNI call
+  that does NOT check Thread.isInterrupted, so the underlying native generation
+  keeps running on the IO dispatcher thread until it finishes (or 60s timeout
+  fires). HOWEVER — because LiteRtlmEngine does NOT have a ProgressListener
+  (it emits chunks AFTER the sync call returns via the word-by-word loop at
+  lines 348-355), there are NO rogue onChunk calls after Stop. The LiteRT path
+  is therefore less visibly broken — Stop "feels" like it works because no
+  tokens stream post-Stop, even though the native call is still grinding away
+  in the background. Noted as a separate latent issue (abandoned native call
+  still holds the engine for up to 60s) but NOT what the user is seeing.
+- Issue 2 (newlines): Grep'd ChatViewModel.kt for streamingChunk/_streamingChunk.
+  Found the streaming callback at ChatViewModel.kt:547-553: each chunk is passed
+  through `MarkdownParser.sanitize(chunk)` BEFORE being appended to
+  _streamingChunk. The same sanitize() is applied AGAIN to the full final text
+  at line 578 before persisting. Read MarkdownParser.kt fully (157 lines) —
+  the sanitize() function has FOUR passes (tag-strip, literal-\n→newline,
+  literal-\r removal, real \r removal). NONE of the passes collapse runs of
+  consecutive newlines. So if the model emits `\n\n\n\n\n` (a known
+  degenerate state for small models like Qwen 0.5B / SmolLM 135M when they
+  get confused mid-generation), sanitize() faithfully passes all 5 newlines
+  through to the UI, which renders them as a wall of blank lines. This is
+  compounded by Issue 1: even after Stop, the rogue listener keeps appending
+  `\n` tokens, growing the wall indefinitely until the abandoned native call
+  finally finishes (or hits max-tokens). The user sees a streaming bubble
+  filling with newlines that won't stop.
+- Issue 3 (auto-scroll): Grep'd MainScreen.kt for scroll|isAtBottom|LaunchedEffect.
+  Found the auto-scroll LaunchedEffect at MainScreen.kt:741-771. Current logic:
+    • isAtBottom = derivedStateOf { !listState.canScrollForward } (line 736-738)
+    • lastMsgCount tracks previous messages.size (line 739)
+    • LaunchedEffect(messages.size, streamingChunk) (line 741):
+        - newMessageAdded = messages.size > lastMsgCount (line 746)
+        - if (!newMessageAdded && !isAtBottom) return (line 751) — i.e. streaming
+          chunks only auto-scroll if user is already at the bottom
+        - compute expectedTotal and call listState.animateScrollToItem(expectedTotal)
+          (line 769)
+    • "Scroll to bottom" FAB at MainScreen.kt:1016-1054 — visible whenever
+      canScrollForward && messages.isNotEmpty() (line 1026-1030), taps
+      animate-scroll back to bottom.
+  This IS the WhatsApp/Telegram pattern in principle. But the user's complaint
+  ("cumbersome to manually scroll when chat goes below the visible lane")
+  points to a subtle race in the current implementation:
+    1. Streaming chunk N arrives → list grows → bottom moves down → list is
+       momentarily NOT at bottom (canScrollForward becomes true) → isAtBottom
+       flips to false.
+    2. LaunchedEffect fires for chunk N+1 → checks isAtBottom → it's FALSE
+       (because chunk N's growth pushed the bottom past the viewport) →
+       return early → NO auto-scroll.
+    3. The animateScrollToItem from chunk N may still be running; when it
+       completes the list IS at the bottom again (isAtBottom=true), but chunk
+       N+2, N+3 have already arrived in the meantime and pushed the bottom
+       further down → isAtBottom=false again.
+  Net effect: during fast streaming, the auto-scroll "stutters" — it scrolls,
+  then skips, then scrolls again. The user sees the latest text dipping below
+  the viewport and has to manually scroll to catch up, which fights the
+  intermittent auto-scroll. animateScrollToItem makes this worse because each
+  call cancels the in-flight animation, causing visual jank.
+- Verified the StreamingBubble is rendered with no engine-state guard
+  (MainScreen.kt:1009) — this confirms Issue 1's UI symptom: the bubble
+  re-appears post-Stop whenever the rogue listener re-populates
+  _streamingChunk.
+
+Stage Summary:
+
+═══════════════════════════════════════════════════════════════════════
+ISSUE 1 — "Stop button doesn't stop the LLM" (CONFIRMED, ROOT CAUSE FOUND)
+═══════════════════════════════════════════════════════════════════════
+
+ROOT CAUSE: The Stop button's onClick handler is correctly wired
+  (MainScreen.kt:1584 → onStop → MainScreen.kt:879 → vm.stopGeneration() →
+  ChatViewModel.kt:131-142 → job.cancel()), AND job.cancel() does cancel the
+  parent coroutine, AND the parent's await() throws CancellationException as
+  expected (LlmEngine.kt:656-657, 668-671). BUT — the actual native LLM call
+  `engine.generateResponseAsync(prompt, listener)` (LlmEngine.kt:619) runs on a
+  SEPARATE CoroutineScope (`generationScope`, LlmEngine.kt:160-161 — a
+  SupervisorJob that survives parent cancellation by design, to avoid crashing
+  the engine). The ProgressListener at LlmEngine.kt:612-617 fires onChunk for
+  EVERY token the abandoned native call generates, with NO cancellation check
+  inside the listener. The onChunk closure (ChatViewModel.kt:547-553) keeps
+  appending to `_streamingChunk.value` after Stop, including AFTER
+  ChatViewModel.kt:619 sets it back to "". Because MainScreen.kt:1009-1010
+  renders StreamingBubble whenever `streamingChunk.isNotEmpty()` (with NO
+  `activeEngineState is Generating` guard), the user sees a streaming bubble
+  keep filling with tokens — especially newlines if the model is in a
+  degenerate `\n`-loop — even though the Send button is back.
+
+EXACT FILE:LINE REFERENCES:
+  • Stop button UI:        MainScreen.kt:1561-1592 (Box onClick = onStop)
+  • Stop plumbing:         MainScreen.kt:879 (onStop = { vm.stopGeneration() })
+  • stopGeneration():      ChatViewModel.kt:131-142 (job.cancel() + markReady)
+  • currentGenJob capture: ChatViewModel.kt:543
+  • Native call wrapper:   LlmEngine.kt:598-655 (generationScope.async {…})
+  • Generation scope decl: LlmEngine.kt:160-161 (SupervisorJob — survives cancel)
+  • Rogue listener:        LlmEngine.kt:612-617 (onChunk w/ no cancellation check)
+  • onChunk closure:       ChatViewModel.kt:547-553 (_streamingChunk.value += …)
+  • _streamingChunk reset: ChatViewModel.kt:619 (set to "" after persist)
+  • StreamingBubble shown: MainScreen.kt:1009-1010 (no engine-state guard)
+  • MarkReady "abandoned": LlmEngine.kt:483-484 (comment admits call continues)
+
+SPECIFIC FIX NEEDED (3 layers, all required):
+
+  (A) GUARD THE LISTENER — LlmEngine.kt:612-617
+      Capture the parent Job BEFORE creating the listener, then check
+      `isActive` before calling onChunk. Pseudocode:
+        val parentJob = currentCoroutineContext()[Job]
+        val listener = ProgressListener<String> { partialToken, done ->
+            if (partialToken.isNotEmpty() && parentJob?.isActive != false) {
+                onChunk(partialToken)
+            }
+        }
+      This alone stops the rogue emissions from reaching _streamingChunk.
+
+  (B) CANCEL THE NATIVE FUTURE — LlmEngine.kt:618-620
+      `engine.generateResponseAsync(prompt, listener)` returns a
+      `ListenableFuture<String>` (per MediaPipe 0.10.35 API). Store it in a
+      local var and cancel it on CancellationException:
+        val future = engine.generateResponseAsync(prompt, listener)
+        try { future.get() } catch (ce: CancellationException) {
+            future.cancel(true)   // interrupt the native generation
+            throw ce
+        }
+      MediaPipe's ListenableFuture.cancel(true) DOES interrupt the underlying
+      native generation thread — this is the only way to actually stop the
+      model from burning CPU/battery after Stop. Without this, the abandoned
+      call keeps generating until max_tokens (could be 10-30s on a 0.5B model).
+      NOTE: must verify in MediaPipe 0.10.35 source that cancel(true) actually
+      interrupts the native worker — if not, we fall back to (A) which at
+      least stops the UI symptom.
+
+  (C) GUARD THE STREAMING BUBBLE — MainScreen.kt:1009
+      Add an engine-state guard so the StreamingBubble cannot render when
+      the engine is NOT in Generating state. Change:
+          if (streamingChunk.isNotEmpty()) {
+              item { StreamingBubble(streamingChunk) }
+          }
+      to:
+          if (streamingChunk.isNotEmpty() &&
+              activeEngineState is LlmState.Generating) {
+              item { StreamingBubble(streamingChunk) }
+          }
+      This is belt-and-suspenders: even if (A) and (B) both fail, the user
+      won't see a zombie streaming bubble after Stop.
+
+  Also recommended:
+  (D) Clear _streamingChunk SYNCHRONOUSLY in stopGeneration() — ChatViewModel.kt:131-142
+      Currently _streamingChunk is cleared at line 619 AFTER the persist
+      completes (inside withContext(NonCancellable)). Between Stop-tap and
+      line 619, the rogue listener can keep appending. Add
+      `_streamingChunk.value = ""` IMMEDIATELY in stopGeneration() BEFORE
+      job.cancel(), so any subsequent rogue onChunk calls start from an empty
+      buffer. Combined with (A), this guarantees the UI shows no post-Stop
+      tokens.
+
+═══════════════════════════════════════════════════════════════════════
+ISSUE 2 — "LLM emits excessive newlines" (CONFIRMED, ROOT CAUSE FOUND)
+═══════════════════════════════════════════════════════════════════════
+
+ROOT CAUSE: Two compounding problems:
+  (1) MarkdownParser.sanitize() has NO pass that collapses runs of consecutive
+      newlines. The four passes (MarkdownParser.kt:117-153) handle tag-strip,
+      literal-\n→\n, literal-\r removal, real \r removal — but a run of N
+      actual newlines passes through unchanged. So when a small model (Qwen
+      0.5B, SmolLM 135M) gets stuck emitting `\n` tokens in a loop (a known
+      degenerate state for under-trained small models), the user sees a wall
+      of blank lines growing in real-time.
+  (2) Compounded by Issue 1 — even after Stop, the rogue listener keeps
+      appending `\n` tokens. The user perceives this as "the LLM kept putting
+      new line" long after they tapped Stop. Once Issue 1 is fixed, the
+      runaway-newlines symptom will be much less severe (it'll only happen
+      mid-generation, not post-Stop), but we should still add collapsing as
+      a defense-in-depth measure.
+
+EXACT FILE:LINE REFERENCES:
+  • Streaming append:    ChatViewModel.kt:547-553 (sanitize per-chunk, then +=)
+  • Final sanitize:      ChatViewModel.kt:578 (sanitize(full) before persist)
+  • Sanitize function:   MarkdownParser.kt:112-156
+  • Pass 1 (tag-strip):  MarkdownParser.kt:127-129
+  • Pass 2 (\n→\n):      MarkdownParser.kt:134-144
+  • Pass 3 (\r removal): MarkdownParser.kt:151-153
+  • MISSING pass 4:      (would go between line 153 and `return result`)
+  • StreamingBubble:     MainScreen.kt:1009-1010, 1141+ (renders raw text w/
+                          no further newline collapsing)
+
+SPECIFIC FIX NEEDED:
+
+  (A) ADD PASS 4 TO MarkdownParser.sanitize() — MarkdownParser.kt:153
+      Collapse runs of 3+ newlines to 2 (preserves paragraph breaks, kills
+      walls of blank lines). Insert before `return result`:
+          // ── Pass 4: Collapse runs of 3+ newlines into 2 ─────────────
+          // Small models in degenerate states emit long runs of `\n` tokens.
+          // We collapse 3+ consecutive newlines (with optional whitespace
+          // between them) into exactly 2, preserving paragraph breaks but
+          // killing walls of blank lines. 2 newlines = one blank line in
+          // markdown rendering, which is the maximum useful spacing.
+          if (result.contains('\n')) {
+              result = result.replace(Regex("\\n{3,}"), "\n\n")
+              // Also collapse runs that have whitespace (spaces/tabs) mixed
+              // in between newlines: "\n \n \n" → "\n\n"
+              result = result.replace(Regex("(\\n[ \\t]*\\n){2,}"), "\n\n")
+          }
+      IMPORTANT: this MUST be applied to BOTH the per-chunk sanitize (line 552)
+      AND the final sanitize (line 578). The per-chunk path is trickier
+      because a chunk boundary may split a run of newlines (e.g. chunk1 ends
+      with "\n\n", chunk2 starts with "\n\n" — neither alone triggers the
+      collapse, but the combined buffer has 4 newlines). Two options:
+        Option 1 — re-sanitize the FULL _streamingChunk on every chunk emit
+          (slow but correct): replace line 552 with
+            _streamingChunk.value = MarkdownParser.sanitize(_streamingChunk.value + chunk)
+        Option 2 — keep per-chunk sanitize (fast) but ALSO sanitize the full
+          _streamingChunk once on every Nth chunk (e.g. every 10 chunks) and
+          always on the final persist. This bounds the worst-case wall-of-
+          newlines to ~10 chunks of height before it gets collapsed.
+      Recommendation: Option 1 is simpler and the perf hit is negligible on
+      a 0.5B model (chunks are tiny, sanitize is O(n) regex). Go with Option 1.
+
+  (B) TRIM TRAILING NEWLINES ON PERSIST — ChatViewModel.kt:580, 586, 1232
+      When persisting the partial (post-Stop) or final message, also trim
+      trailing whitespace/newlines so the bubble doesn't render with empty
+      space at the bottom:
+          chatRepo.appendMessage(chatId, Role.ASSISTANT, final.trimEnd())
+
+  (C) ANTI-LOOP GUARD IN ENGINE (DEFENSIVE, OPTIONAL) — LlmEngine.kt:612-617
+      As a deeper defense, track the last 5 tokens in the listener; if all 5
+      are "\n", abort the generation early (the model is stuck). This is what
+      PocketPal/LLMFarm do. Implement as:
+          val recentTokens = ArrayDeque<String>(5)
+          val listener = ProgressListener<String> { partialToken, done ->
+              if (partialToken == "\n") {
+                  recentTokens.addLast("\n")
+                  if (recentTokens.size >= 8) {
+                      // Abort — model is in a newline loop
+                      future.cancel(true)
+                      return@ProgressListener
+                  }
+              } else {
+                  recentTokens.clear()
+              }
+              // … existing onChunk logic …
+          }
+      This catches the degenerate state at the source rather than relying on
+      UI-side collapsing. Recommend implementing (A) first (handles all
+      runaway-newline cases including post-Stop), then (C) as a v2 hardening.
+
+═══════════════════════════════════════════════════════════════════════
+ISSUE 3 — "Make the scroll automatic" (CURRENT LOGIC FOUND, RECOMMENDATION)
+═══════════════════════════════════════════════════════════════════════
+
+CURRENT SCROLL LOGIC — MainScreen.kt:703-771:
+  • isAtBottom = derivedStateOf { !listState.canScrollForward } (line 736-738)
+  • lastMsgCount var (line 739) — tracks previous messages.size to detect
+    "new message added" vs "streaming chunk arrived"
+  • LaunchedEffect(messages.size, streamingChunk) at line 741:
+      - newMessageAdded = messages.size > lastMsgCount (line 746)
+      - line 751: `if (!newMessageAdded && !isAtBottom) return@LaunchedEffect`
+        ← streaming chunks only auto-scroll if user is already at bottom
+      - line 761-763: compute expectedTotal (messages + thinking + streaming)
+      - line 769: listState.animateScrollToItem(expectedTotal)
+  • "Scroll to bottom" FAB at lines 1016-1054 — visible when
+    canScrollForward && messages.isNotEmpty(), taps animate-scroll to bottom.
+
+PROBLEM DIAGNOSIS:
+  The current logic IS the WhatsApp/Telegram pattern in principle, but it
+  stutters during fast streaming because of two issues:
+    1. isAtBottom is a derivedState computed from the LazyListState's layout
+       info, which lags one frame behind the actual scroll position. Between
+       a chunk arrival and the LaunchedEffect firing, isAtBottom can flip to
+       false (because the new chunk pushed the bottom past the viewport),
+       causing the auto-scroll to be skipped.
+    2. animateScrollToItem cancels any in-flight animation on each call. With
+       chunks arriving every ~50-200ms, the animation never completes —
+       visual jank + the user's manual scroll-up gesture gets overridden by
+       the next animateScrollToItem call.
+
+RECOMMENDED APPROACH (WhatsApp/Telegram-style, three changes):
+
+  (A) USE INSTANT SCROLL FOR STREAMING CHUNKS — MainScreen.kt:769
+      During streaming, replace `animateScrollToItem(expectedTotal)` with
+      `scrollToItem(expectedTotal)` (no animation). The instant jump is what
+      Telegram uses during fast streaming — there's no perceivable animation
+      anyway because chunks arrive faster than a 250ms animation could
+      complete. Keep `animateScrollToItem` for the new-message-added case
+      (where there's a real transition from "user message" to "assistant
+      reply starts") and for the FAB tap.
+        if (newMessageAdded) {
+            listState.animateScrollToItem(expectedTotal)  // smooth
+        } else {
+            listState.scrollToItem(expectedTotal)         // instant
+        }
+
+  (B) ADD A "user scrolled up" STICKY FLAG — MainScreen.kt:736-739
+      The current isAtBottom is too sensitive — any transient layout change
+      can flip it. Replace it with an explicit `userScrolledUp` flag that
+      is set to TRUE when the user manually scrolls up, and reset to FALSE
+      when (a) the FAB is tapped, or (b) a new message is added (so the next
+      user-send always re-anchors to bottom). Implement via a
+      snapshotFlow on listState.firstVisibleItemIndex / canScrollForward,
+      filtered to ignore programmatic scrolls:
+          var userScrolledUp by remember { mutableStateOf(false) }
+          LaunchedEffect(listState) {
+              snapshotFlow { listState.canScrollForward to listState.isScrollInProgress }
+                  .filter { !it.second }  // only when scroll settles
+                  .collect { (canFwd, _) ->
+                      if (canFwd && expectedTotal > 0) userScrolledUp = true
+                  }
+          }
+      Then in the main LaunchedEffect:
+          if (!newMessageAdded && userScrolledUp) return@LaunchedEffect
+      And clear userScrolledUp on new-message-added and on FAB tap.
+      This is the actual WhatsApp behavior: once you scroll up, the chat
+      stays where you are until YOU bring it back to the bottom.
+
+  (C) THROTTLE THE SCROLL DURING STREAMING — MainScreen.kt:741
+      Even with instant scrollToItem, calling it on every chunk (every ~50ms)
+      wastes CPU and can still cause jank. Throttle to once per ~150ms:
+          var lastScrollTime by remember { mutableStateOf(0L) }
+          LaunchedEffect(messages.size, streamingChunk) {
+              // … existing logic …
+              val now = System.currentTimeMillis()
+              if (!newMessageAdded && now - lastScrollTime < 150) return@LaunchedEffect
+              lastScrollTime = now
+              listState.scrollToItem(expectedTotal)
+          }
+      Combined with (B), this gives the user time to initiate a scroll-up
+      gesture between auto-scrolls — so the gesture isn't overridden.
+
+  RECOMMENDED IMPLEMENTATION ORDER:
+    1. (A) instant scroll for streaming — biggest UX win, lowest risk
+    2. (B) userScrolledUp sticky flag — required to make "let me read
+       history" reliable
+    3. (C) throttle — polish, can ship later if (A)+(B) is enough
+
+  WHAT NOT TO DO: do NOT remove the isAtBottom/userScrolledUp guard
+  entirely. The user's original complaint ("I can't scroll up to read
+  history") would regress. The goal is "auto-follow while at bottom,
+  stop-following when user scrolls up, resume-following on FAB tap" —
+  which is exactly what (A)+(B) achieves.
+
+═══════════════════════════════════════════════════════════════════════
+CROSS-ISSUE NOTES
+═══════════════════════════════════════════════════════════════════════
+
+• Issue 1 and Issue 2 are coupled: fixing Issue 1 (rogue listener) will
+  dramatically reduce the "excessive newlines" symptom because most of the
+  runaway newlines appear AFTER Stop. But the user will still see walls of
+  newlines mid-generation if the model gets stuck, so Issue 2's fix
+  (MarkdownParser pass 4) is still needed.
+
+• The map-reduce summary path (ChatViewModel.kt:1190-1253) has the same
+  Stop-doesn't-actually-stop problem if summarizer.summarize() internally
+  calls LlmEngine.generateReplyStream (which it does — summarizer wraps the
+  engine). Fixing Issue 1 at the engine level automatically fixes the
+  map-reduce path too. The post-summary typewriter loop at lines 1221-1230
+  uses delay(15L) which IS cancellable, so Stop during the typewriter phase
+  works correctly today.
+
+• The vision path (ChatViewModel.kt:1126-1163) calls
+  liteRtlm.generateReplyStream which has the same "abandoned native call"
+  issue as LlmEngine — see LiteRtlmEngine.kt:299-368 analysis above. But
+  because LiteRT has no ProgressListener (no rogue onChunk), the UI symptom
+  is hidden. Should still be fixed for CPU/battery hygiene: cancel the
+  withTimeoutOrNull block explicitly on Stop (currently relies on the 60s
+  timeout firing). Lower priority than Issue 1's main fix.
+
+• No code was modified in this investigation (research-only task). All
+  file:line references above are accurate as of the current source state.

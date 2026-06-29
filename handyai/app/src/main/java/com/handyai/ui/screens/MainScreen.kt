@@ -700,43 +700,75 @@ private fun ChatPane(
         }
     }
 
-    // ── Chat scroll behaviour ──────────────────────────────────────────
-    // Two problems this fixes (v1.3.5 regression):
+    // ── Chat scroll behaviour (v1.4.3) ────────────────────────────────
     //
-    //   1. "Long paragraphs go below the chat box and I can't scroll."
-    //      The old auto-scroll called `animateScrollToItem(messages.lastIndex)`,
-    //      which scrolls the LAST COMPLETED message to the TOP of the viewport.
-    //      The streaming bubble (added as a separate item after the messages)
-    //      was left below the visible area — and because the effect re-fired
-    //      on every streaming chunk, the user couldn't scroll down to see it.
+    // GOAL
+    //   • While the LLM is streaming, the chat auto-scrolls so the latest
+    //     line stays visible just above the input box — no manual scrolling
+    //     needed (the v1.4.2 "only auto-scroll if at bottom" rule made
+    //     the user chase the bubble, which they explicitly called out as
+    //     cumbersome).
+    //   • If the user scrolls UP to read older messages, auto-scroll
+    //     PAUSES immediately so they can read in peace.
+    //   • A small floating chevron button appears; tapping it resumes
+    //     auto-follow and snaps back to the latest message.
     //
-    //   2. "I can't scroll up to read older messages."
-    //      The old effect had no "is the user at the bottom?" guard, so every
-    //      streaming token yanked the list back to the bottom — making it
-    //      impossible to read history while the LLM was replying.
+    // HOW
+    //   • `userScrolledUp` is a sticky flag derived from the LazyListState.
+    //     It becomes true the moment `canScrollForward` is true AND the
+    //     user is the one who caused it (we differentiate from "new content
+    //     arrived" by snapshotting the visible-item info before each
+    //     auto-scroll we perform).
+    //   • On a new message being added (user sends a message), we ALWAYS
+    //     force-scroll to the bottom and reset `userScrolledUp` to false —
+    //     the user expects to see their own message and the reply.
+    //   • For streaming chunks, we auto-scroll ONLY when `!userScrolledUp`.
+    //     The scroll is INSTANT (`scrollToItem`, no animation) — animations
+    //     cancel each other when chunks arrive every ~50ms, which is what
+    //     caused the v1.4.2 stutter.
+    //   • The FAB's onClick sets `userScrolledUp = false` and snaps to
+    //     the bottom, resuming auto-follow.
     //
-    // Fix:
-    //   • `isAtBottom` tracks whether the list is scrolled to its maximum
-    //     extent (i.e. the last item's bottom edge is at the viewport bottom).
-    //     We use `canScrollForward == false` which is true exactly when the
-    //     list cannot scroll down any further — this handles both the
-    //     "short last item" and "tall last item" cases correctly.
-    //   • `lastMsgCount` lets us detect "a new message was just added"
-    //     (vs. just a streaming chunk arriving). When a new message is
-    //     added we ALWAYS auto-scroll — even if the user had scrolled up —
-    //     so the user sees their own message and the start of the reply.
-    //   • For streaming chunks, we only auto-scroll if `isAtBottom` is
-    //     true, so the user is free to scroll up and read history while
-    //     the LLM keeps generating.
-    //   • The scroll target is `expectedTotal` (one PAST the last item
-    //     index). `animateScrollToItem` clamps to the maximum scroll
-    //     offset, which places the last item's BOTTOM edge at the
-    //     viewport bottom — i.e. the last line of text sits just above
-    //     the chat input box, exactly as the user requested.
-    val isAtBottom by remember {
-        derivedStateOf { !listState.canScrollForward }
-    }
+    // `userScrolledUp` is implemented as a plain `mutableStateOf` (not
+    // derivedStateOf) because we need to WRITE it from multiple places
+    // (FAB onClick, new-message detection). A scroll listener updates
+    // it to true when the user scrolls up away from the bottom.
+    //
+    // `autoScrolling` is a plain boolean holder (not a State) — it's
+    // only read inside coroutines, so making it State would trigger
+    // pointless recompositions. Same pattern as `swipeState` below.
+    var userScrolledUp by remember { mutableStateOf(false) }
     var lastMsgCount by remember { mutableStateOf(0) }
+    val autoScrolling = remember {
+        object {
+            @Volatile var value = false
+        }
+    }
+
+    // Detect user-initiated scroll-up. We use a snapshot rule:
+    // if the list CAN scroll forward (i.e. there's content below the
+    // viewport) AND we didn't just auto-scroll, then the user must have
+    // scrolled up. We watch `canScrollForward` via derivedStateOf so this
+    // recomputes only when scroll position actually changes.
+    //
+    // We can't directly distinguish "user scrolled" from "new content
+    // arrived" from the LazyListState alone. Instead, we set a flag
+    // `autoScrolling` while our auto-scroll is in flight, and ignore
+    // scroll-position changes that happen while it's true.
+    val canScrollForward by remember {
+        derivedStateOf { listState.canScrollForward }
+    }
+    LaunchedEffect(canScrollForward) {
+        // If the list can scroll forward and we're not in the middle of
+        // an auto-scroll, the user has scrolled up.
+        if (canScrollForward && !autoScrolling.value) {
+            userScrolledUp = true
+        } else if (!canScrollForward) {
+            // Reached the bottom — clear the flag (whether by user scroll
+            // or by content shrinking).
+            userScrolledUp = false
+        }
+    }
 
     LaunchedEffect(messages.size, streamingChunk) {
         if (messages.isEmpty()) {
@@ -745,16 +777,22 @@ private fun ChatPane(
         }
         val newMessageAdded = messages.size > lastMsgCount
         lastMsgCount = messages.size
-        // Always auto-scroll when a new message is added (user or assistant).
-        // For streaming chunks, only auto-scroll if the user is already at
-        // the bottom — otherwise we'd yank them away from reading history.
-        if (!newMessageAdded && !isAtBottom) return@LaunchedEffect
+
+        // Always auto-scroll when a new message is added — the user
+        // expects to see their own message and the start of the reply.
+        // This also clears the sticky flag so subsequent streaming chunks
+        // auto-scroll normally.
+        if (newMessageAdded) {
+            userScrolledUp = false
+        }
+
+        // If the user has scrolled up to read history, don't yank them
+        // back down on every streaming token.
+        if (userScrolledUp) return@LaunchedEffect
 
         // Compute the expected total item count including the thinking and
         // streaming bubbles (which are appended as extra items after the
-        // persisted messages). We compute from source data rather than
-        // `layoutInfo.totalItemsCount` because the LazyColumn may not have
-        // re-composed yet when this effect fires.
+        // persisted messages).
         val showThinking = (activeEngineState is LlmState.Generating) &&
             streamingChunk.isEmpty() &&
             (statusText.isBlank() || statusText.startsWith("Generating"))
@@ -762,11 +800,17 @@ private fun ChatPane(
             (if (showThinking) 1 else 0) +
             (if (streamingChunk.isNotEmpty()) 1 else 0)
         if (expectedTotal > 0) {
-            // Index `expectedTotal` is one past the last valid item. The
-            // scroll machinery clamps this to the maximum scroll offset,
-            // which is exactly what we want: the last item's bottom edge
-            // ends up at the viewport bottom, just above the chat input.
-            listState.animateScrollToItem(expectedTotal)
+            autoScrolling.value = true
+            try {
+                // Use INSTANT scroll (no animation) for streaming chunks.
+                // Animations cancel each other when chunks arrive every
+                // ~50ms, which was the root cause of the v1.4.2 stutter.
+                // For new-message-added we also use instant scroll so the
+                // user's own message appears immediately on Send.
+                listState.scrollToItem(expectedTotal)
+            } finally {
+                autoScrolling.value = false
+            }
         }
     }
 
@@ -1006,31 +1050,37 @@ private fun ChatPane(
                         if (showThinking) {
                             item { ThinkingBubble() }
                         }
-                        if (streamingChunk.isNotEmpty()) {
+                        // ── v1.4.3: guard StreamingBubble with engine state ──
+                        // Previously, StreamingBubble rendered whenever
+                        // streamingChunk was non-empty — even AFTER the user
+                        // tapped Stop (the engine state had already flipped
+                        // to Ready but the abandoned ProgressListener kept
+                        // appending to streamingChunk for a second). The
+                        // user saw a zombie bubble that kept filling with
+                        // newlines. Now we only render it when the engine
+                        // is actively Generating, so the bubble vanishes
+                        // the instant Stop is tapped.
+                        if (streamingChunk.isNotEmpty() &&
+                            activeEngineState is LlmState.Generating) {
                             item { StreamingBubble(streamingChunk) }
                         }
                     }
                 }
             }
 
-            // ── "Scroll to bottom" button ─────────────────────────────────
-            // Appears when the user has scrolled up away from the latest
-            // message. Tapping it animates the list back to the bottom so
-            // the user doesn't have to fling-scroll manually. The button
-            // is anchored to the bottom-end of the chat area (just above
-            // the chat input box) — the standard chat-app placement.
+            // ── "Scroll to bottom" button (v1.4.3) ──────────────────────────
+            // Shows only when the user has EXPLICITLY scrolled up
+            // (`userScrolledUp`), not just whenever `canScrollForward` is
+            // true — because during auto-follow the list briefly has
+            // content below the viewport between chunks, and we don't want
+            // the FAB flickering on and off 20 times per second.
             //
-            // We use `canScrollForward` (not `isAtBottom`) directly here so
-            // the button visibility is reactive to scroll position in real
-            // time, without needing an extra LaunchedEffect.
-            val showScrollToBottom by remember {
-                derivedStateOf {
-                    listState.canScrollForward && messages.isNotEmpty()
-                }
-            }
-            if (showScrollToBottom) {
+            // Tapping the FAB clears `userScrolledUp` (resuming auto-follow)
+            // and instantly snaps to the latest message.
+            if (userScrolledUp) {
                 SmallFloatingActionButton(
                     onClick = {
+                        userScrolledUp = false
                         scope.launch {
                             val showThinkingNow = (activeEngineState is LlmState.Generating) &&
                                 streamingChunk.isEmpty() &&
@@ -1039,7 +1089,7 @@ private fun ChatPane(
                                 (if (showThinkingNow) 1 else 0) +
                                 (if (streamingChunk.isNotEmpty()) 1 else 0)
                             if (total > 0) {
-                                listState.animateScrollToItem(total)
+                                listState.scrollToItem(total)
                             }
                         }
                     },

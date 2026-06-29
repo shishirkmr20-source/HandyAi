@@ -58,9 +58,9 @@ package com.handyai.ui.components
  * `text.length == layout.text.length` is invariant — the caret
  * positioning in [StreamingBubble] can never go out of bounds.
  *
- * WHAT REMAINS (v1.4.2)
+ * WHAT REMAINS (v1.4.3)
  * =====================
- * Only [sanitize] — which now performs FOUR passes:
+ * Only [sanitize] — which now performs FIVE passes:
  *
  *   1. **Tag stripping** (v1.4.2 — SmolLM fix): SmolLM-135M and
  *      similar tiny models often wrap their output in XML/HTML-style
@@ -96,6 +96,12 @@ package com.handyai.ui.components
  *      [MarkdownTable]. The TTS path has its own sanitizer
  *      ([com.handyai.tts.TtsSpeechSanitizer]) that converts tables to
  *      spoken prose without affecting the displayed text.
+ *
+ *   5. **Newline-run collapse** (v1.4.3 — user-reported): small models
+ *      sometimes get stuck emitting `\n` in a loop, producing long
+ *      runs of blank lines that push the chat bubble off-screen. This
+ *      pass collapses any run of 3+ newlines down to exactly 2 (one
+ *      blank line — the markdown standard paragraph break).
  *
  * Applied to:
  *   - Each streaming chunk in ChatViewModel (live)
@@ -150,6 +156,24 @@ object MarkdownParser {
         // paragraph breaks, list formatting, and markdown tables.
         if (result.contains('\r')) {
             result = result.replace("\r\n", "\n").replace("\r", "")
+        }
+
+        // ── Pass 4: Collapse runs of 3+ newlines (v1.4.3) ──────────────
+        // Small on-device models (Qwen 0.5B, SmolLM 135M) sometimes get
+        // stuck in a newline-emission loop, producing "\n\n\n\n\n…" runs
+        // that push the chat bubble off-screen. The user reported:
+        // "in one of the chat the llm kept putting new line".
+        //
+        // We collapse any run of 3+ consecutive newlines (optionally
+        // separated by whitespace) down to exactly 2 newlines (one blank
+        // line — the markdown standard for a paragraph break). Runs of
+        // exactly 2 are preserved so legitimate paragraph breaks still
+        // render as blank lines.
+        //
+        // The regex matches 3+ newlines with any spaces/tabs between them.
+        // Replaced with exactly "\n\n".
+        if (result.length >= 3 && result.contains("\n")) {
+            result = result.replace(Regex("\n(?:[ \t]*\n){2,}"), "\n\n")
         }
 
         return result

@@ -607,9 +607,33 @@ class LlmEngine(private val context: Context) {
                         // MediaPipe 0.10.35 exposes this on LlmInference
                         // (not just on the session). The listener fires
                         // with each partial token as it's generated.
+                        //
+                        // ── v1.4.3: CANCELLATION-AWARE LISTENER ──────────────
+                        // The previous version had a serious Stop-button bug:
+                        // when the user tapped Stop, `job.cancel()` only
+                        // interrupted `deferred.await()` — the native
+                        // `future.get()` kept running and the ProgressListener
+                        // kept firing `onChunk()` for every token the
+                        // abandoned native call generated. Because the
+                        // listener closure appended to `_streamingChunk` in
+                        // the ViewModel (with no cancellation check), the
+                        // user saw a zombie streaming bubble that kept
+                        // filling with text (often newlines) AFTER Stop.
+                        //
+                        // Fix: capture the current Job and check `isActive`
+                        // before forwarding each token. Also cancel the
+                        // ListenableFuture on CancellationException so the
+                        // native side stops ASAP (MediaPipe's future supports
+                        // `cancel(true)` which interrupts the native thread).
+                        val listenerJob = kotlin.coroutines.coroutineContext[Job]
                         val listenerFired = java.util.concurrent.atomic.AtomicBoolean(false)
                         @Suppress("DEPRECATION")
                         val listener = com.google.mediapipe.tasks.genai.llminference.ProgressListener<String> { partialToken, done ->
+                            // Drop tokens if the parent job has been cancelled.
+                            // This is the key fix: even though the native call
+                            // keeps running until future.cancel propagates, we
+                            // stop forwarding its output to the UI instantly.
+                            if (listenerJob?.isActive == false) return@ProgressListener
                             if (partialToken.isNotEmpty()) {
                                 listenerFired.set(true)
                                 onChunk(partialToken)
@@ -617,9 +641,21 @@ class LlmEngine(private val context: Context) {
                         }
                         val asyncResult: String = try {
                             val future = engine.generateResponseAsync(prompt, listener)
-                            future.get()
-                        } catch (ee: java.util.concurrent.ExecutionException) {
-                            throw ee.cause ?: ee
+                            try {
+                                future.get()
+                            } catch (ee: java.util.concurrent.ExecutionException) {
+                                // Unwrap to surface the real cause (e.g. MediaPipe runtime error)
+                                throw ee.cause ?: ee
+                            } catch (ce: kotlinx.coroutines.CancellationException) {
+                                // Parent coroutine was cancelled (user tapped Stop).
+                                // Cancel the native future so the native generation
+                                // thread stops ASAP — without this, MediaPipe keeps
+                                // generating tokens in the background for seconds,
+                                // burning CPU/battery and (worse) keeping the
+                                // ProgressListener alive firing into the void.
+                                future.cancel(true)
+                                throw ce
+                            }
                         } catch (asyncErr: Throwable) {
                             // Async path failed — fall back to sync call.
                             android.util.Log.w(TAG,
