@@ -670,7 +670,15 @@ class ChatViewModel(
         }
 
         // ── 2. ROUTE ───────────────────────────────────────────────────
-        val routed = com.handyai.llm.PromptRouter.route(userText)
+        val routedRaw = com.handyai.llm.PromptRouter.route(userText)
+        // Filter out the web_search rule when internet is OFF so its prompt
+        // paragraph doesn't bloat the system prompt for nothing (the actual
+        // web context is already gated on internetEnabled below).
+        val routed = if (!internetEnabled.value) {
+            routedRaw.copy(matchedRules = routedRaw.matchedRules.filter { it.id != "web_search" })
+        } else {
+            routedRaw
+        }
 
         // ── 3. PREFERENCE LEARNER HINT ─────────────────────────────────
         val prefHint = try { preferenceLearner.buildHint() } catch (_: Throwable) { "" }

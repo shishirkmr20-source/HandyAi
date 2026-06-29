@@ -128,24 +128,18 @@ object PromptRouter {
                 "Do not say \"I have saved...\" if no [APP ACTION] line is present below."
         ),
 
-        // ── ATTACHMENT HANDLING ─────────────────────────────────────────
-        Rule(
-            id = "attachment",
-            description = "Tell the LLM how attachments work",
-            triggers = listOf(
-                "attach", "attachment", "file", "document", "pdf", "docx",
-                "image", "picture", "photo", "screenshot", "scan",
-                "extract", "read this", "see this", "look at this",
-                "what does this", "what's in this", "what is in this",
-                "summarize", "summarise", "summary", "tldr", "tl;dr",
-                "key points", "main points"
-            ),
-            prompt = "Attachment handling: when the user attaches a file or image, the app extracts its " +
-                "content to text on-device (PDF/DOCX/PPTX/XLSX/TXT/HTML via on-device parsers; images via " +
-                "ML Kit OCR + image labeling) and includes it in the prompt between markers. When those " +
-                "markers are present, you HAVE seen the content — do not claim you cannot read attachments. " +
-                "Quote from the extracted text when answering."
-        ),
+        // ── ATTACHMENT HANDLING (REMOVED v1.4.2) ─────────────────────────
+        // This rule previously fired on broad triggers ("file", "document",
+        // "image", "what is", "how to", "summarize") which matched almost
+        // ANY substantive question. On small models (Qwen 0.5B) the injected
+        // paragraph was echoed back verbatim — the user saw the model reply
+        // with "document downloaded image downloaded" text on the FIRST chat,
+        // and the extra ~400 chars made first-token latency worse.
+        //
+        // The attachment instruction is now injected ONLY when a file is
+        // actually attached — see ChatViewModel.buildSmartSystemPrompt's
+        // `fileBlock` (gated on hasFile). Non-attachment messages no longer
+        // carry any attachment-related text, keeping the prompt minimal.
 
         // ── HABIT/JOURNAL CONTEXT LOOKUP ────────────────────────────────
         Rule(
@@ -164,15 +158,21 @@ object PromptRouter {
         ),
 
         // ── WEB SEARCH (only when internet enabled) ─────────────────────
+        // Narrowed in v1.4.2: previously fired on "what is", "how to",
+        // "who is" etc. — phrases that appear in almost every question.
+        // Now only fires on explicit freshness signals (latest, recent,
+        // news, today, weather, score, etc.) so the web-search paragraph
+        // + actual web search don't bloat every reply's latency.
         Rule(
             id = "web_search",
             description = "Tell LLM that web context may be included",
             triggers = listOf(
                 "latest", "recent", "today", "yesterday", "this week",
-                "news", "current", "now", "update", "what's happening",
-                "weather", "stock", "price", "score", "result",
-                "who won", "who is", "what is", "where is", "when is",
-                "how do i", "how to", "tutorial", "guide"
+                "news", "current events", "what's happening", "whats happening",
+                "weather", "stock", "stock price", "score", "match result",
+                "who won", "election", "update on", "price of",
+                "now showing", "now playing", "box office",
+                "just released", "just came out", "new release"
             ),
             prompt = "Web search results may be included below when the user's question benefits from " +
                 "fresh information. Cite the source URL when relevant."
