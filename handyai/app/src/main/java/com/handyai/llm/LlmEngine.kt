@@ -147,6 +147,44 @@ class LlmEngine(private val context: Context) {
      *   - File must not start with "<" (HTML/XML, not a binary .task file)
      */
     suspend fun setActiveModel(path: String, modelId: String? = null, paramCountB: Double? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        // ── MEMORY-AWARE MAX_TOKENS (computed before try so it's visible in catch) ──
+        // On phones with ≤ 4 GB RAM, a 2048-token KV cache + the model
+        // weights + the JVM heap + bitmap memory can push the app into
+        // OOM-kill territory. We detect the device's RAM and per-app heap
+        // budget BEFORE the try block so the GPU-fallback catch block can
+        // reuse the same values without re-fetching from ActivityManager.
+        val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+            as? android.app.ActivityManager
+        val memoryClass = am?.memoryClass ?: 256
+        val totalMemMb = am?.let {
+            android.app.ActivityManager.MemoryInfo().also { mi ->
+                it.getMemoryInfo(mi)
+            }.totalMem / (1024L * 1024L)
+        } ?: 4096L
+
+        val effectiveMaxTokens = when {
+            totalMemMb < 3072 -> {
+                android.util.Log.i(TAG,
+                    "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1024")
+                1024
+            }
+            totalMemMb < 5120 -> {
+                android.util.Log.i(TAG,
+                    "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1280")
+                1280
+            }
+            memoryClass <= 192 -> {
+                android.util.Log.i(TAG,
+                    "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at 1536")
+                1536
+            }
+            else -> {
+                android.util.Log.i(TAG,
+                    "Normal-RAM device (totalMem=${totalMemMb}MB, memoryClass=${memoryClass}MB) — using MAX_TOKENS=$MAX_TOKENS")
+                MAX_TOKENS
+            }
+        }
+
         try {
             val file = File(path)
             android.util.Log.i(TAG, "Loading model: $path (${file.length()} bytes)")
@@ -181,87 +219,20 @@ class LlmEngine(private val context: Context) {
 
             // Build options. setMaxTokens must be >= 1 and within the model's
             // supported range. The litert-community models ship with a fixed
-            // max sequence length (often 4096 or 8192); setting 1024 here is
-            // safe across all of them and keeps memory footprint predictable.
+            // max sequence length (often 4096 or 8192); 1024-2048 is safe
+            // across all of them. The actual value is computed above
+            // (effectiveMaxTokens) based on device RAM + heap size — see
+            // the comment block above the try for the full rationale.
             //
-            // ── MEMORY-AWARE MAX_TOKENS ───────────────────────────────────
-            // On phones with ≤ 4 GB RAM, a 2048-token KV cache + the model
-            // weights + the JVM heap + bitmap memory can push the app into
-            // OOM-kill territory — especially after a few chat turns when
-            // the message list has grown. The OS kills the process with no
-            // exception, no log, just a silent "app crashed."
-            //
-            // FIX (v1.3.0): Use TWO signals together —
-            //   1. ActivityManager.memoryClass (per-app Dalvik heap in MB).
-            //      This is the JVM-only budget. With largeHeap="true" the
-            //      effective limit is largeMemoryClass, but memoryClass is
-            //      still a useful proxy for "is this a low-end device."
-            //   2. ActivityManager.MemoryInfo.totalMem (device RAM in bytes).
-            //      This is the GROUND TRUTH for phone-vs-tablet detection.
-            //      Tablets typically have 6-12 GB; phones often have 3-6 GB.
-            //      The memoryClass check alone missed phones with 4 GB RAM
-            //      and a 256 MB heap — they passed the ≤192 MB threshold
-            //      but still got OOM-killed after a few chats because the
-            //      native MediaPipe allocations live OUTSIDE the Dalvik heap
-            //      (mmap'd GPU/AI memory, not counted toward memoryClass).
-            //
-            // Decision matrix:
-            //   - totalMem < 3 GB          → cap at 1024 (very tight)
-            //   - totalMem < 5 GB          → cap at 1280 (phone, 3-5 GB)
-            //   - memoryClass ≤ 192 MB     → cap at 1536 (low-heap device)
-            //   - otherwise                → 2048 (default, tablets + good phones)
-            //
-            // The most aggressive cap wins. Trimming KV cache by 50% only
-            // costs ~10-15% of conversational recall (the sliding-window
-            // history trim already keeps prompts short) and is a much better
-            // trade than a silent OOM crash.
-            val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
-                as? android.app.ActivityManager
-            val memoryClass = am?.memoryClass ?: 256
-            val totalMemMb = am?.let {
-                android.app.ActivityManager.MemoryInfo().also { mi ->
-                    it.getMemoryInfo(mi)
-                }.totalMem / (1024L * 1024L)
-            } ?: 4096L
-
-            val effectiveMaxTokens = when {
-                totalMemMb < 3072 -> {
-                    android.util.Log.i(TAG,
-                        "Very-low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1024")
-                    1024
-                }
-                totalMemMb < 5120 -> {
-                    android.util.Log.i(TAG,
-                        "Low-RAM device (totalMem=${totalMemMb}MB) — capping MAX_TOKENS at 1280")
-                    1280
-                }
-                memoryClass <= 192 -> {
-                    android.util.Log.i(TAG,
-                        "Low-heap device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at 1536")
-                    1536
-                }
-                else -> {
-                    android.util.Log.i(TAG,
-                        "Normal-RAM device (totalMem=${totalMemMb}MB, memoryClass=${memoryClass}MB) — using MAX_TOKENS=$MAX_TOKENS")
-                    MAX_TOKENS
-                }
-            }
+            // ── GPU BACKEND ─────────────────────────────────────────────
+            // We request Backend.GPU here. If the device doesn't support
+            // GPU LLM inference, createFromOptions() throws below and the
+            // catch block retries with Backend.DEFAULT (CPU).
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(path)
                 .setMaxTokens(effectiveMaxTokens)
                 .setMaxTopK(40)
                 .apply {
-                    // ── GPU BACKEND ATTEMPT ─────────────────────────────
-                    // MediaPipe 0.10.35 exposes Backend.GPU for LLM inference.
-                    // On devices with a capable GPU + OpenCL, this can give
-                    // 2-4x faster token generation than CPU. On devices that
-                    // don't support it, createFromOptions throws — we catch
-                    // that below and fall back to Backend.DEFAULT (CPU).
-                    //
-                    // We try GPU first because the speed difference is
-                    // dramatic on supported devices. The fallback ensures
-                    // we never fail to load a model just because GPU isn't
-                    // available.
                     try {
                         setPreferredBackend(LlmInference.Backend.GPU)
                         android.util.Log.i(TAG, "Requesting GPU backend for LLM inference")
@@ -299,6 +270,8 @@ class LlmEngine(private val context: Context) {
             if (gpuFailed) {
                 android.util.Log.w(TAG, "GPU backend failed ($msg) — retrying with CPU (Backend.DEFAULT)")
                 try {
+                    // effectiveMaxTokens is now computed above the try block
+                    // and is visible here.
                     val cpuOptions = LlmInference.LlmInferenceOptions.builder()
                         .setModelPath(path)
                         .setMaxTokens(effectiveMaxTokens)
