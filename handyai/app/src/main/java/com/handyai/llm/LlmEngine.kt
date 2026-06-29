@@ -701,22 +701,20 @@ class LlmEngine(private val context: Context) {
         }
         val opts = LlmInferenceSession.LlmInferenceSessionOptions.builder()
             .apply {
-                // Session options in MediaPipe 0.10.35:
-                //   setTopk(Int), setTopp(Double), setTemperature(Float),
+                // Session options in MediaPipe 0.10.35 (verified from
+                // bytecode of LlmInferenceSessionOptions.Builder):
+                //   setTopK(Int), setTopP(Double), setTemperature(Float),
                 //   setRandomSeed(Long), setLoraPath(String),
-                //   setGraphConfig(...), setPromptTemplates(...),
-                //   setEnableVisionModality(Boolean), etc.
+                //   setGraphOptions(...), setPromptTemplates(...),
+                //   setConstraintHandle(...)
                 //
                 // NOTE: there is NO setMaxTokens on the session options —
                 // the max-tokens budget is set on the ENGINE options
                 // (LlmInference.LlmInferenceOptions.setMaxTokens) when the
                 // model is loaded. The session inherits that budget.
-                try {
-                    setTopk(40)
-                } catch (_: Throwable) {}
-                try {
-                    setTemperature(0.8f)
-                } catch (_: Throwable) {}
+                //
+                // We use the engine's defaults — the session inherits
+                // sampling config from the engine options.
             }
             .build()
         val newSession = LlmInferenceSession.createFromOptions(engine, opts)
