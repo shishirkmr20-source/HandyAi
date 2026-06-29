@@ -490,25 +490,19 @@ class ChatViewModel(
         val sb = StringBuilder()
         sb.appendLine("You are HandyAi, a helpful assistant running fully on-device. Be concise and friendly.")
         sb.appendLine()
-        // Formatting instruction — bold key terms so they stand out
-        // visually in the chat bubble. Small models comply reliably with
-        // **double-asterisk** bold; they do NOT reliably emit headings,
-        // lists, or other Markdown, so we only ask for bold.
+        // ── WHY NO BOLD INSTRUCTION ────────────────────────────────────
+        // Earlier versions asked the model to wrap key terms in **double
+        // asterisks** for bold rendering. We removed the MarkdownParser
+        // that converted those markers into styled spans (it caused a
+        // hard crash — see MarkdownParser.kt HISTORY block for details).
+        // Without the parser, ** markers would show up as literal
+        // asterisks in the chat bubble, which looks broken. So we no
+        // longer ask the model to emit them.
         //
-        // IMPORTANT: small on-device models tend to "forget" this instruction
-        // partway through long replies — they bold the first term then stop.
-        // To counter this, the instruction is (a) written as a mandatory
-        // rule, (b) includes a multi-sentence example showing bold used
-        // THROUGHOUT a long reply (not just once), and (c) repeated as a
-        // final reminder at the very end of the system prompt (recency bias
-        // — small models follow the last instruction they saw best).
-        sb.appendLine("FORMATTING RULE (MUST FOLLOW): In every reply, wrap important words, key terms, numbers, names, and section labels in **double asterisks** to make them bold. This is mandatory — every reply must have at least 2-3 bolded terms, and you must continue bolding throughout your ENTIRE reply, not just the first sentence. Even in long multi-paragraph replies, keep bolding important terms in every paragraph.")
-        sb.appendLine()
-        sb.appendLine("Example of a properly formatted long reply:")
-        sb.appendLine("\"The **Kubernetes** system manages **containerized applications** across a cluster of machines. It was originally developed by **Google** in **2014** and is now maintained by the **Cloud Native Computing Foundation**. Key features include **automatic bin packing**, **self-healing**, and **horizontal scaling**. Each cluster runs a **control plane** that manages **worker nodes**, which host the actual **pods** — the smallest deployable units. For storage, Kubernetes supports **persistent volumes**, **ephemeral storage**, and **storage classes** for dynamic provisioning.\"")
-        sb.appendLine()
-        sb.appendLine("Do not use headings, lists, or other Markdown — ONLY **bold**.")
-        sb.appendLine()
+        // Small on-device models don't reliably follow formatting
+        // instructions anyway — they would often bold the first term
+        // then forget for the rest of the reply. Plain text is cleaner.
+        sb.appendLine("Reply in plain text. Do not use Markdown, **asterisks**, #headings, or -lists. Just write natural sentences and paragraphs.")
 
         // ── MINIMAL MODE ──────────────────────────────────────────────
         // When a file is attached, strip ALL non-essential context so the
@@ -637,13 +631,10 @@ class ChatViewModel(
         // ── FINAL REMINDER ───────────────────────────────────────────
         // Small on-device models lose instructions partway through long
         // system prompts (recency bias: they follow the LAST instruction
-        // best). Repeating the bold rule here, right before the model's
-        // turn, dramatically increases the chance that bold markers appear
-        // throughout the entire reply — especially in long multi-paragraph
-        // responses where the model would otherwise stop bolding after the
-        // first sentence.
+        // best). Repeat the plain-text rule here so the model doesn't
+        // start emitting **bold** markers partway through its reply.
         sb.appendLine()
-        sb.appendLine("REMINDER: You MUST use **double asterisks** to bold important terms, numbers, and key phrases throughout your ENTIRE reply. Keep bolding in every paragraph — do not stop after the first sentence.")
+        sb.appendLine("REMINDER: Reply in plain text only. Do not use **asterisks**, #headings, or -lists.")
         return sb.toString().trim().takeIf { it.isNotEmpty() } ?: ""
     }
 

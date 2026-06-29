@@ -184,9 +184,30 @@ class LlmEngine(private val context: Context) {
             // supported range. The litert-community models ship with a fixed
             // max sequence length (often 4096 or 8192); setting 1024 here is
             // safe across all of them and keeps memory footprint predictable.
+            //
+            // ── MEMORY-AWARE MAX_TOKENS ───────────────────────────────────
+            // On phones with ≤ 4 GB RAM, a 2048-token KV cache + the model
+            // weights + the JVM heap + bitmap memory can push the app into
+            // OOM-kill territory — especially after a few chat turns when
+            // the message list has grown. The OS kills the process with no
+            // exception, no log, just a silent "app crashed."
+            //
+            // Fix: detect low-RAM devices via ActivityManager.getMemoryClass()
+            // (the per-app heap budget in MB). If it's ≤ 192 MB (typical for
+            // 4 GB phones), cap MAX_TOKENS at 1536 instead of 2048. This
+            // trims ~25% off the KV cache memory with minimal quality impact
+            // (the sliding-window history trim already keeps prompts short).
+            val memoryClass = (context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager)?.memoryClass ?: 256
+            val effectiveMaxTokens = if (memoryClass <= 192) {
+                android.util.Log.i(TAG, "Low-RAM device (memoryClass=${memoryClass}MB) — capping MAX_TOKENS at 1536")
+                (MAX_TOKENS * 3 / 4).coerceAtLeast(1024)
+            } else {
+                MAX_TOKENS
+            }
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(path)
-                .setMaxTokens(MAX_TOKENS)
+                .setMaxTokens(effectiveMaxTokens)
                 .build()
             android.util.Log.i(TAG, "Calling LlmInference.createFromOptions()…")
             llm = LlmInference.createFromOptions(context, options)

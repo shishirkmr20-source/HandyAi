@@ -169,12 +169,48 @@ fun MessageBubble(
                     // "broken image" placeholder instead of crashing.
                     if (hasImage) {
                         val imagePath = message.imagePath!!
+                        // ── MEMORY-SAFE BITMAP DECODING ──────────────────────
+                        // Previously this called BitmapFactory.decodeFile(path)
+                        // with no sampling — a 1024×1024 PNG (the default
+                        // /draw output size) decodes to a 4 MB bitmap in ARGB
+                        // 8888. On a phone with 4 GB RAM, holding several of
+                        // these in the LazyColumn's composition while the LLM
+                        // is also running its KV cache pushes the app into
+                        // OOM territory — the OS kills the process and the
+                        // app "crashes after chats."
+                        //
+                        // Fix: sample the bitmap down to the maximum display
+                        // size (312dp × 360dp ≈ 936×1080 px on a 3x density
+                        // screen). A 936×1080 ARGB bitmap is ~4 MB → ~1 MB
+                        // after sampling, a 4× memory saving per bubble.
+                        //
+                        // The decode is still synchronous on the main thread
+                        // (acceptable — image-gen produces ~1 MB PNGs and the
+                        // sampled decode is fast). If this becomes a jank
+                        // source, move to a LaunchedEffect + Dispatchers.IO.
                         val bitmap = remember(imagePath) {
                             try {
                                 val file = File(imagePath)
-                                if (file.exists()) {
-                                    BitmapFactory.decodeFile(imagePath)
-                                } else null
+                                if (!file.exists()) null
+                                else {
+                                    // First pass: just read the bounds (no
+                                    // pixel allocation) to compute sample size.
+                                    val bounds = BitmapFactory.Options().apply {
+                                        inJustDecodeBounds = true
+                                    }
+                                    BitmapFactory.decodeFile(imagePath, bounds)
+                                    val density = context.resources.displayMetrics.density
+                                    val reqW = (312 * density).toInt().coerceAtLeast(1)
+                                    val reqH = (360 * density).toInt().coerceAtLeast(1)
+                                    val sample = calcInSampleSize(bounds.outWidth, bounds.outHeight, reqW, reqH)
+                                    val opts = BitmapFactory.Options().apply {
+                                        inSampleSize = sample
+                                        // RGB_565 is half the size of ARGB_8888
+                                        // and looks fine for photos/illustrations.
+                                        inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+                                    }
+                                    BitmapFactory.decodeFile(imagePath, opts)
+                                }
                             } catch (_: Throwable) { null }
                         }
                         if (bitmap != null) {
@@ -435,4 +471,30 @@ private suspend fun saveImageToGallery(context: android.content.Context, imagePa
             Toast.LENGTH_LONG
         ).show()
     }
+}
+
+/**
+ * Calculate the [BitmapFactory.Options.inSampleSize] for decoding a bitmap
+ * that will be displayed at approximately [reqWidth] × [reqHeight] pixels.
+ *
+ * This is the standard Android sample-size calculation from the official
+ * training docs: start with sample = 1, double it until both dimensions
+ * are smaller than the requested size, then return that sample.
+ *
+ * Why this matters: a 1024×1024 PNG decoded at full resolution is a 4 MB
+ * bitmap (ARGB_8888). On a phone with 4 GB RAM, the LazyColumn may hold
+ * several of these simultaneously while the LLM KV cache is also consuming
+ * memory — pushing the app into OOM territory. Sampling down to the actual
+ * display size (typically ≤ 936×1080) cuts the bitmap to ~1 MB, a 4× saving.
+ *
+ * Combined with [android.graphics.Bitmap.Config.RGB_565] (half the size of
+ * ARGB_8888), each image bubble uses ~500 KB instead of 4 MB.
+ */
+private fun calcInSampleSize(outWidth: Int, outHeight: Int, reqWidth: Int, reqHeight: Int): Int {
+    if (outWidth <= 0 || outHeight <= 0) return 1
+    var sample = 1
+    while (outWidth / sample > reqWidth || outHeight / sample > reqHeight) {
+        sample *= 2
+    }
+    return sample
 }

@@ -85,7 +85,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Column(modifier = Modifier.padding(20.dp)) {
                     Text("HandyAi", style = MaterialTheme.typography.headlineMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer)
-                    Text("Version 1.2.9", style = MaterialTheme.typography.bodyMedium,
+                    Text("Version 1.3.0", style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer)
                     Spacer(Modifier.height(6.dp))
                     Text(

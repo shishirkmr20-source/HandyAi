@@ -238,20 +238,68 @@ private fun JournalEditor(
     var content by remember { mutableStateOf(entry?.content ?: "") }
     var mood by remember { mutableStateOf(entry?.mood ?: "") }
 
+    val palette = handyAiPalette()
+    val canSave = content.isNotBlank()
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(if (entry == null) "New entry" else "Edit entry") },
                 navigationIcon = {
                     IconButton(onClick = onCancel) { Icon(Icons.Default.Close, "Cancel") }
-                },
-                actions = {
-                    IconButton(
-                        onClick = { if (content.isNotBlank()) onSave(title.trim(), content.trim(), mood.ifBlank { null }) },
-                        enabled = content.isNotBlank()
-                    ) { Icon(Icons.Default.Check, "Save") }
                 }
             )
+        },
+        bottomBar = {
+            // ── Prominent Save button at the bottom ────────────────────
+            // The previous design only had a tiny Check icon in the top
+            // app bar — users looked for a "plus" or "save" button at the
+            // bottom (where the FAB is on the parent screen) and couldn't
+            // find it. This full-width gradient button matches the chat
+            // Send button's style so the "commit" action is consistent
+            // across the app.
+            Surface(
+                tonalElevation = 3.dp,
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .height(52.dp)
+                        .clip(RoundedCornerShape(26.dp))
+                        .background(
+                            if (canSave) Brush.horizontalGradient(
+                                listOf(palette.indigo, palette.lavender)
+                            )
+                            else Brush.horizontalGradient(
+                                listOf(palette.indigo.copy(alpha = 0.35f),
+                                       palette.lavender.copy(alpha = 0.35f))
+                            )
+                        )
+                        .clickable(enabled = canSave) {
+                            onSave(title.trim(), content.trim(), mood.ifBlank { null })
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Check,
+                            "Save",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            if (entry == null) "Save entry" else "Update entry",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
         }
     ) { padding ->
         Column(
@@ -279,10 +327,17 @@ private fun JournalEditor(
             OutlinedTextField(
                 value = content,
                 onValueChange = { content = it },
-                label = { Text("Entry") },
+                label = { Text("Entry *") },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 240.dp),
                 shape = RoundedCornerShape(12.dp)
             )
+            if (content.isBlank()) {
+                Text(
+                    "The entry body is required to save.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
         }
     }
 }
