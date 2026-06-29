@@ -135,3 +135,42 @@ Stage Summary:
 - Expected improvement: 5-10x faster perceived latency (first token in 1-2s vs 5-15s, no artificial typing delay). On GPU-supported devices, actual generation may also be 2-4x faster.
 - Future optimization (v1.3.4+): use LlmInferenceSession with addQueryChunk for KV cache reuse across turns — would eliminate re-processing the entire conversation history on every message. Requires session lifecycle management (create per chat, invalidate on system-prompt change, reset on model swap).
 - CRITICAL: User's GitHub PAT (ghp_DTqG7...Rq30) still works and was used again. User MUST revoke it at https://github.com/settings/tokens.
+
+---
+Task ID: ios-port-v1
+Agent: Super Z (main)
+Task: Create an iOS version of HandyAi, push to a new GitHub repo "HandyAi iOS", and ship the source for download.
+
+Work Log:
+- Clarified to the user up-front: cannot compile Swift → .ipa on Linux. Building an iOS app requires macOS + Xcode. This is a hard platform constraint, not a tooling limitation.
+- Read key Android source files to understand feature surface: ModelCatalog.kt, MarkdownParser.kt, MarkdownTable.kt, ImageAnalyzer.kt, CloudImageAnalyzer.kt, SettingsRepository.kt, HandyAiDatabase.kt, all 5 Room entities, LlmEngine.kt.
+- Wrote 39 Swift files (~2,300 lines of Swift) implementing:
+    * App entry point + RootView TabView (Chat / Journal / Habits / Settings)
+    * SQLite3 persistence layer (raw SQLite3, no GRDB, same schema as Android Room v7)
+    * Repositories for Chat / Message / Journal / Habit / Settings / AttachmentCache
+    * LlmEngine wrapper around llama.swift (llama.cpp Swift bindings) — streams tokens, supports cancel, uses 8 threads + 1024 context + 512 batch for fast small-model inference
+    * ModelCatalog with 4 GGUF models (Qwen 0.5B, SmolLM 135M, Qwen 1.5B, Phi-4 Mini) — same model families as Android but GGUF format (llama.cpp) instead of .task (MediaPipe)
+    * ModelDownloader (URLSession download tasks to HuggingFace)
+    * ImageAnalyzer (Vision VNRecognizeTextRequest for OCR + VNClassifyImageRequest for labels — same plain-prose format as Android, no confidence scores in output)
+    * CloudImageAnalyzer (HuggingFace BLIP captioner — same endpoint as Android)
+    * FileTextExtractor (PDFKit for PDFs, plain-text reader for .txt/.md, dispatches images to cloud→on-device fallback)
+    * MessageBubble with markdown pipe-table rendering (MarkdownTable.swift) — splits assistant replies into text blocks + tables, renders tables as native SwiftUI tables (header tinted, zebra striped, horizontal scroll for wide tables)
+    * Right-side ModelsDrawer that slides in from the trailing edge with scrim + tap-outside + swipe-right-to-dismiss (mirrors Android v1.3.4+ behavior)
+    * 5 themes (Cream / Sunset / Ocean / Midnight / Forest)
+    * JournalScreen, HabitTrackerScreen, SettingsScreen
+    * TtsEngine (AVSpeechSynthesizer), SttEngine (SFSpeechRecognizer), WebSearchService (DuckDuckGo HTML scrape), CrashLogger (NSException + signal handlers → crash.log)
+- project.yml (XcodeGen spec) with llama.swift SPM dependency
+- Info.plist with all permissions (mic, photos, camera, speech, photo library add)
+- ExportOptions.plist for xcodebuild -exportArchive
+- README.md with full build instructions (brew install xcodegen → xcodegen generate → open in Xcode → ⌘R, plus the one-liner xcodebuild archive + exportArchive command for producing the unsigned .ipa)
+- Initialized git repo at /home/z/my-project/handyai-ios
+- Created GitHub repo "HandyAi-iOS" via API (https://github.com/shishirkmr20-source/HandyAi-iOS) — public, default branch main
+- Pushed initial commit (b84724d) with all 39 Swift files + project.yml + README + LICENSE + Info.plist + ExportOptions.plist + .gitignore
+- Scrubbed PAT from .git/config remote URL after push
+- Packaged source as HandyAi-iOS-source.zip (61 KB) and uploaded to gofile.io: https://gofile.io/d/goz3yJ
+
+Stage Summary:
+- New GitHub repo: https://github.com/shishirkmr20-source/HandyAi-iOS (public)
+- Source .zip download: https://gofile.io/d/goz3yJ (61 KB, 39 Swift files)
+- Cannot produce compiled .ipa on this Linux environment — user must run `xcodegen generate && xcodebuild archive -exportArchive` on a Mac to produce the .ipa. README has the exact commands.
+- CRITICAL: User's GitHub PAT (ghp_DTqG7...Rq30) is STILL VALID and was used again to create the repo and push. User MUST revoke it at https://github.com/settings/tokens — it has now been exposed in plaintext multiple times in this session's conversation context.
