@@ -75,49 +75,92 @@ class ModelSettingsViewModel(
         // ── DISPATCH BY MODEL TYPE ────────────────────────────────────
         // VISION_LITERTLM models (.litertlm files) go through LiteRtlmEngine;
         // everything else (.task files) goes through MediaPipe LlmEngine.
-        when (spec.modelType) {
-            ModelType.VISION_LITERTLM -> {
-                // LiteRT-LM alpha05 declares minSdk 31 (Android 12) in its
-                // manifest. We use tools:overrideLibrary so the APK installs
-                // on older Android, but the runtime will crash on activation
-                // below API 31. Guard here with a friendly error instead.
-                if (android.os.Build.VERSION.SDK_INT < 31) {
-                    val msg = "Vision models (FastVLM) require Android 12 or newer. " +
-                        "Your device is Android ${android.os.Build.VERSION.RELEASE} " +
-                        "(API ${android.os.Build.VERSION.SDK_INT}). " +
-                        "Use a text-only model (Qwen / Phi / SmolLM) instead — image " +
-                        "attachments will still work via on-device ML Kit OCR + labels."
-                    llm.surfaceError(msg)
-                    return@launch
+        try {
+            when (spec.modelType) {
+                ModelType.VISION_LITERTLM -> {
+                    // LiteRT-LM alpha05 declares minSdk 31 (Android 12) in its
+                    // manifest. We use tools:overrideLibrary so the APK installs
+                    // on older Android, but the runtime will crash on activation
+                    // below API 31. Guard here with a friendly error instead.
+                    if (android.os.Build.VERSION.SDK_INT < 31) {
+                        val msg = "Vision models (FastVLM) require Android 12 or newer. " +
+                            "Your device is Android ${android.os.Build.VERSION.RELEASE} " +
+                            "(API ${android.os.Build.VERSION.SDK_INT}). " +
+                            "Use a text-only model (Qwen / Phi / SmolLM) instead — image " +
+                            "attachments will still work via on-device ML Kit OCR + labels."
+                        llm.surfaceError(msg)
+                        return@launch
+                    }
+                    // Pre-flight: verify the file exists and is non-trivial
+                    // before handing off to the native loader. A missing or
+                    // truncated file causes a native crash that bypasses
+                    // Java exception handling.
+                    val modelFile = java.io.File(path)
+                    if (!modelFile.exists() || modelFile.length() < 100 * 1024) {
+                        val msg = "Vision model file is missing or too small " +
+                            "(${modelFile.length()} bytes). Please delete and re-download."
+                        llm.surfaceError(msg)
+                        return@launch
+                    }
+                    // Unload the MediaPipe engine if a .task model was previously
+                    // active (the two engines can't run simultaneously without
+                    // eating ~5GB of RAM combined).
+                    if (llm.isModelLoaded()) {
+                        llm.unload()
+                    }
+                    // ── v1.4.2: extra defensive try-catch around the entire
+                    // LiteRT-LM activation. The native library can throw
+                    // UnsatisfiedLinkError or RuntimeException subclasses that
+                    // wouldn't be caught by the engine's internal try-catch
+                    // (they happen during class loading or native method
+                    // registration, before setActiveModel's body runs).
+                    val result = try {
+                        liteRtlm.setActiveModel(path)
+                    } catch (nativeErr: Throwable) {
+                        android.util.Log.e("HandyAi/ModelSettingsVM",
+                            "Vision model native activation threw", nativeErr)
+                        llm.surfaceError(nativeErr.message ?: nativeErr.javaClass.simpleName
+                            ?: "Vision model failed to load (native error)")
+                        return@launch
+                    }
+                    result.onSuccess {
+                        settings.setActiveModel(path, spec.displayName)
+                    }.onFailure { err ->
+                        llm.surfaceError(err.message ?: "Failed to activate vision model")
+                    }
                 }
-                // Unload the MediaPipe engine if a .task model was previously
-                // active (the two engines can't run simultaneously without
-                // eating ~5GB of RAM combined).
-                if (llm.isModelLoaded()) {
-                    llm.unload()
+                ModelType.LLM -> {
+                    // Unload the LiteRT-LM engine if a .litertlm model was
+                    // previously active.
+                    if (liteRtlm.isModelLoaded()) {
+                        liteRtlm.unload()
+                    }
+                    val result = try {
+                        llm.setActiveModel(path, spec.id, spec.paramCountB)
+                    } catch (t: Throwable) {
+                        android.util.Log.e("HandyAi/ModelSettingsVM",
+                            "LLM activation threw", t)
+                        return@launch
+                    }
+                    result.onSuccess {
+                        settings.setActiveModel(path, spec.displayName)
+                    }
                 }
-                val result = liteRtlm.setActiveModel(path)
-                result.onSuccess {
-                    settings.setActiveModel(path, spec.displayName)
-                }.onFailure { err ->
-                    llm.surfaceError(err.message ?: "Failed to activate vision model")
+                ModelType.IMAGE_GEN -> {
+                    // Image generation is a built-in cloud feature now — no
+                    // activation needed.
                 }
             }
-            ModelType.LLM -> {
-                // Unload the LiteRT-LM engine if a .litertlm model was
-                // previously active.
-                if (liteRtlm.isModelLoaded()) {
-                    liteRtlm.unload()
-                }
-                val result = llm.setActiveModel(path, spec.id, spec.paramCountB)
-                result.onSuccess {
-                    settings.setActiveModel(path, spec.displayName)
-                }
-            }
-            ModelType.IMAGE_GEN -> {
-                // Image generation is a built-in cloud feature now — no
-                // activation needed.
-            }
+        } catch (t: Throwable) {
+            // ── v1.4.2: top-level safety net ────────────────────────────
+            // If anything escapes the per-engine try-catches above (e.g. a
+            // NoClassDefFoundError if LiteRT-LM's classes aren't on the
+            // classpath on an older device), surface a friendly error
+            // instead of letting the ViewModel crash.
+            android.util.Log.e("HandyAi/ModelSettingsVM",
+                "Model activation top-level failure", t)
+            llm.surfaceError(t.message ?: t.javaClass.simpleName
+                ?: "Could not activate model — unknown error")
         }
     }
 

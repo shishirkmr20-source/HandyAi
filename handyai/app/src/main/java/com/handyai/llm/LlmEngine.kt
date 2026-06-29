@@ -195,6 +195,28 @@ class LlmEngine(private val context: Context) {
      *   - File must not start with "<" (HTML/XML, not a binary .task file)
      */
     suspend fun setActiveModel(path: String, modelId: String? = null, paramCountB: Double? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        // ── MODEL-SWITCH SAFETY (v1.4.2) ──────────────────────────────────
+        // Acquire the generationMutex BEFORE touching the engine so that
+        // any in-flight generation completes (or is safely cancelled)
+        // before we close the old model. Without this, the model switch
+        // could crash: the in-flight async calls engine.generateResponse()
+        // on a CLOSED LlmInference instance → native crash (use-after-close).
+        // This was the root cause of "app crashes when changing models".
+        generationMutex.withLock {
+            // Cancel any in-flight or queued abandoned asyncs BEFORE closing
+            // the native engine. Same rationale as in unload().
+            runCatching { generationScope.coroutineContext[Job]?.cancelChildren() }
+            // Close the KV-cache session first (still kept for cleanup parity
+            // even though we no longer use it for generation — see
+            // generateReplyStream's v1.4.2 comment).
+            runCatching { session?.close() }
+            session = null
+            sessionFingerprint = null
+            sessionTurnCount = 0
+            // Now safe to close the old model.
+            try { llm?.close() } catch (_: Throwable) {}
+            llm = null
+
         // ── MEMORY-AWARE MAX_TOKENS (computed before try so it's visible in catch) ──
         // On phones with ≤ 4 GB RAM, a 2048-token KV cache + the model
         // weights + the JVM heap + bitmap memory can push the app into
@@ -394,6 +416,7 @@ class LlmEngine(private val context: Context) {
             _state.value = LlmState.Error(failMsg)
             Result.failure(t)
         }
+        } // end generationMutex.withLock
     }
 
     fun unload() {
@@ -407,26 +430,43 @@ class LlmEngine(private val context: Context) {
         // most cases, but cancelling the scope here is belt-and-suspenders.
         runCatching { generationScope.coroutineContext[Job]?.cancelChildren() }
 
-        // Close the KV-cache session first — it holds a reference to the
-        // engine. Closing in the wrong order can crash natively.
-        runCatching { session?.close() }
-        session = null
-        sessionFingerprint = null
-        sessionTurnCount = 0
+        // ── ACQUIRE MUTEX (v1.4.2) ───────────────────────────────────────
+        // Try to acquire the mutex so we don't close the engine while an
+        // in-flight generation is still using it. tryLock() is non-suspend
+        // (unload() is not suspend) and returns immediately. If the lock
+        // is held (a generation is in flight), we proceed anyway — the
+        // cancelChildren() call above will cancel the generation, and the
+        // TOCTOU check inside the async will prevent use-after-close.
+        // The lock is released in the finally block of withLock, but since
+        // unload() is not suspend, we use a plain try/finally with
+        // generationMutex.tryLock() instead.
+        val locked = generationMutex.tryLock()
+        try {
+            // Close the KV-cache session first — it holds a reference to the
+            // engine. Closing in the wrong order can crash natively.
+            runCatching { session?.close() }
+            session = null
+            sessionFingerprint = null
+            sessionTurnCount = 0
 
-        try { llm?.close() } catch (_: Throwable) {}
-        llm = null
-        activeModelPath = null
-        activeModelId = null
-        activeModelParamCount = null
+            try { llm?.close() } catch (_: Throwable) {}
+            llm = null
+            activeModelPath = null
+            activeModelId = null
+            activeModelParamCount = null
 
-        // Hint the GC to reclaim the large native allocations (~500MB-3.7GB
-        // depending on model size) before the next model loads. Without this,
-        // the old model's mmap'd memory may still be resident when the new
-        // model loads, causing OOM on devices with tight RAM.
-        System.gc()
+            // Hint the GC to reclaim the large native allocations (~500MB-3.7GB
+            // depending on model size) before the next model loads. Without this,
+            // the old model's mmap'd memory may still be resident when the new
+            // model loads, causing OOM on devices with tight RAM.
+            System.gc()
 
-        _state.value = LlmState.Idle
+            _state.value = LlmState.Idle
+        } finally {
+            if (locked) {
+                runCatching { generationMutex.unlock() }
+            }
+        }
     }
 
     /**
@@ -525,18 +565,34 @@ class LlmEngine(private val context: Context) {
 
         _state.value = LlmState.Generating
         try {
-            // ── SESSION-BASED GENERATION (v1.4.0) ─────────────────────────
-            // Trim history, then either reuse the existing KV-cache session
-            // (if the system prompt hasn't changed) or create a new one.
-            // The session processes ONLY the new turns — the old turns are
-            // already in the KV cache from the previous call.
+            // ── ENGINE-LEVEL GENERATION WITH PROPER CHATML (v1.4.2) ────────
+            // The previous v1.4.0 session-based approach wrapped the system
+            // prompt with explicit ChatML tags and passed it to
+            // session.addQueryChunk(). MediaPipe's addQueryChunk then
+            // APPLIES THE CHAT TEMPLATE AGAIN — producing malformed nested
+            // tags like `<|im_start|>user\n<|im_start|>system\n...<|im_end|>\n<|im_end|>`.
+            // Small models (Qwen 0.5B) saw this broken input and
+            // hallucinated fragments like "document downloaded image
+            // downloaded" as their first-chat reply — the model was
+            // echoing pieces of the broken prompt structure.
+            //
+            // The fix is to bypass the session API entirely and call
+            // engine.generateResponseAsync(prompt, listener) with a
+            // properly-built ChatML prompt (see [buildPrompt]). This:
+            //   1. Produces CORRECT ChatML every call (no double-wrapping)
+            //   2. Maintains true token streaming via the ProgressListener
+            //   3. Loses KV cache reuse across calls — but the speed is
+            //      still acceptable because small models (0.5B/1.5B)
+            //      process a 1000-token prompt in 1-2s, and larger models
+            //      are less commonly used
+            //   4. Eliminates the entire class of session-state bugs
+            //      (race conditions, stale KV cache, double-wrapped tags)
             val trimmedHistory = trimHistoryToBudget(history, systemPrompt)
-            val fingerprint = computeFingerprint(systemPrompt, trimmedHistory)
+            val prompt = buildPrompt(trimmedHistory, systemPrompt)
 
             android.util.Log.i(TAG,
                 "Generation attempt: ${trimmedHistory.size} turns, " +
-                "sessionFP=${fingerprint.take(8)} (current=${sessionFingerprint?.take(8) ?: "null"}), " +
-                "cachedTurns=$sessionTurnCount")
+                "prompt=${prompt.length} chars (system=${(systemPrompt?.length ?: 0)})")
 
             val full = try {
                 val deferred = generationScope.async {
@@ -546,55 +602,11 @@ class LlmEngine(private val context: Context) {
                                 "Skipping abandoned generation: engine was unloaded/replaced")
                             return@withLock ""
                         }
-                        // Reuse or recreate the session. This is where the
-                        // magic happens — if the system prompt is unchanged
-                        // and we have cached turns, we only addQueryChunk()
-                        // the NEW turns (skipping the ones already in the
-                        // KV cache). This is the PocketPal-style speedup.
-                        val sess = reuseOrCreateSession(engine, systemPrompt, fingerprint)
-                        // Walk the trimmed history, adding only turns past
-                        // the cached count. Each user/assistant turn is
-                        // added as a query chunk — MediaPipe's session
-                        // applies the model's chat template internally.
-                        //
-                        // NOTE: We add the user turn HERE (not in the prompt),
-                        // then call predictAsync to get the assistant reply.
-                        // The assistant reply is then added back so the NEXT
-                        // message sees it in the cache.
-                        val turnsToAdd = trimmedHistory.drop(sessionTurnCount)
-                        for ((role, content) in turnsToAdd) {
-                            val chunk = if (role == "user") {
-                                content
-                            } else {
-                                // Assistant turn — add as if the model
-                                // already said it. We wrap it so the chat
-                                // template knows it's an assistant message.
-                                // MediaPipe's addQueryChunk treats every
-                                // call as a user turn by default, so we
-                                // use the engine-level ChatML tags for
-                                // assistant turns.
-                                // (See MediaPipe LlmInferenceSession docs.)
-                                content
-                            }
-                            try {
-                                sess.addQueryChunk(chunk)
-                                sessionTurnCount++
-                            } catch (addErr: Throwable) {
-                                android.util.Log.e(TAG,
-                                    "addQueryChunk failed on turn $sessionTurnCount " +
-                                    "(role=$role, len=${content.length})", addErr)
-                                // If addQueryChunk fails (e.g. context overflow),
-                                // reset the session and try a fresh one with
-                                // only the latest user turn.
-                                runCatching { sess.close() }
-                                session = null
-                                sessionFingerprint = null
-                                sessionTurnCount = 0
-                                throw addErr
-                            }
-                        }
 
-                        // ── PREDICT (true token streaming via session) ──
+                        // ── TRUE TOKEN STREAMING via engine.generateResponseAsync ──
+                        // MediaPipe 0.10.35 exposes this on LlmInference
+                        // (not just on the session). The listener fires
+                        // with each partial token as it's generated.
                         val listenerFired = java.util.concurrent.atomic.AtomicBoolean(false)
                         @Suppress("DEPRECATION")
                         val listener = com.google.mediapipe.tasks.genai.llminference.ProgressListener<String> { partialToken, done ->
@@ -604,40 +616,36 @@ class LlmEngine(private val context: Context) {
                             }
                         }
                         val asyncResult: String = try {
-                            // MediaPipe 0.10.35 session API: the public
-                            // method is `generateResponseAsync(ProgressListener):
-                            // ListenableFuture<String>`. (There's also an
-                            // internal `predictAsync` but it's not public.)
-                            val future = sess.generateResponseAsync(listener)
+                            val future = engine.generateResponseAsync(prompt, listener)
                             future.get()
                         } catch (ee: java.util.concurrent.ExecutionException) {
                             throw ee.cause ?: ee
-                        } catch (predictErr: Throwable) {
-                            // Session generateResponseAsync failed — fall
-                            // back to the engine-level direct call.
+                        } catch (asyncErr: Throwable) {
+                            // Async path failed — fall back to sync call.
                             android.util.Log.w(TAG,
-                                "Session generateResponseAsync failed — falling back to engine.generateResponse",
-                                predictErr)
-                            runCatching { sess.close() }
-                            session = null
-                            sessionFingerprint = null
-                            sessionTurnCount = 0
-                            val fallbackPrompt = buildPrompt(trimmedHistory, systemPrompt)
-                            engine.generateResponse(fallbackPrompt)
-                        }
-
-                        // If async returned empty + listener never fired,
-                        // retry via engine-level sync call (v1.3.7 fix).
-                        if (asyncResult.isBlank() && !listenerFired.get()) {
-                            android.util.Log.w(TAG,
-                                "Session generateResponseAsync returned empty + listener never fired — " +
-                                "falling back to engine.generateResponse(prompt)")
+                                "generateResponseAsync failed — falling back to sync generateResponse",
+                                asyncErr)
                             try {
-                                val fallbackPrompt = buildPrompt(trimmedHistory, systemPrompt)
-                                engine.generateResponse(fallbackPrompt)
+                                engine.generateResponse(prompt)
                             } catch (syncErr: Throwable) {
                                 android.util.Log.e(TAG,
                                     "Synchronous fallback also failed", syncErr)
+                                ""
+                            }
+                        }
+
+                        // If async returned empty + listener never fired,
+                        // retry via sync call (defensive — shouldn't happen
+                        // with the engine-level API but kept as a safety net).
+                        if (asyncResult.isBlank() && !listenerFired.get()) {
+                            android.util.Log.w(TAG,
+                                "Async returned empty + listener never fired — " +
+                                "retrying via sync generateResponse")
+                            try {
+                                engine.generateResponse(prompt)
+                            } catch (syncErr: Throwable) {
+                                android.util.Log.e(TAG,
+                                    "Sync retry also failed", syncErr)
                                 ""
                             }
                         } else {
@@ -647,14 +655,11 @@ class LlmEngine(private val context: Context) {
                 }
                 deferred.await()
             } catch (ce: CancellationException) {
-                // User-initiated Stop: invalidate the session (its KV cache
-                // is in a partial state for the abandoned assistant turn).
-                // Then propagate WITHOUT retrying.
-                invalidateSession()
+                // User-initiated Stop — no session to invalidate now,
+                // just propagate.
                 throw ce
             } catch (t: Throwable) {
-                android.util.Log.w(TAG, "Generation failed (invalidating session)", t)
-                invalidateSession()
+                android.util.Log.w(TAG, "Generation failed", t)
                 throw t
             }
 

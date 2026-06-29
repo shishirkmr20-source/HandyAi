@@ -81,11 +81,37 @@ class ImageAnalyzer(private val context: Context) {
      * Run OCR + image labeling on the given image Uri.
      * Falls back gracefully — if OCR throws, we still try labeling;
      * if labeling throws, we still return whatever OCR got.
+     *
+     * v1.4.2: Added bitmap downscaling for very large images. A 4000×3000
+     * phone-camera photo decodes to a 48MB bitmap (ARGB_8888), which can
+     * OOM-kill the app on devices with tight RAM. We sample it down to a
+     * max of 2000px on the longest edge BEFORE running OCR — ML Kit
+     * doesn't need full resolution for text recognition (it internally
+     * resizes anyway), and the smaller bitmap is faster to process.
      */
     suspend fun analyze(uri: Uri, displayName: String): Result = withContext(Dispatchers.IO) {
+        // First pass: read just the bounds (no pixel allocation) to
+        // compute a sample size that keeps the longest edge ≤ 2000px.
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, bounds)
+            }
+        } catch (t: Throwable) {
+            null
+        }
+        val sampleSize = if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            var sample = 1
+            while (longest / sample > 2000) sample *= 2
+            sample
+        } else 1
+
         val bitmap = try {
             context.contentResolver.openInputStream(uri)?.use { input ->
-                BitmapFactory.decodeStream(input)
+                BitmapFactory.decodeStream(input, null, BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize
+                })
             }
         } catch (t: Throwable) {
             null

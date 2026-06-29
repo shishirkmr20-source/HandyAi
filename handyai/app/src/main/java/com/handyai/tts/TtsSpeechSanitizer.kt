@@ -17,10 +17,13 @@
 package com.handyai.tts
 
 /**
- * ── TTS SPEECH SANITIZER (v1.4.1) ───────────────────────────────────────
+ * ── TTS SPEECH SANITIZER (v1.4.1 — hardened in v1.4.2) ───────────────────
  *
  * The user reported: "when the voice is enabled and it finds multiple pipes
  * and hyphens for table it just keep on saying it, suppress that."
+ *
+ * Then later clarified: "dont strip the hyphens because then how the table
+ * will get created? find some solution"
  *
  * PROBLEM:
  *   When the LLM emits a markdown table like:
@@ -36,7 +39,20 @@ package com.handyai.tts
  *   This is unlistenable and wastes time. We need to convert the table
  *   to spoken-friendly text BEFORE sending to TextToSpeech.
  *
- * SOLUTION:
+ * SOLUTION (preserves hyphens in the DISPLAYED text):
+ *   This sanitizer ONLY affects what the TTS engine speaks — the actual
+ *   LLM reply (shown in the chat bubble) is untouched. The [MarkdownTable]
+ *   renderer still sees the original pipes and hyphens and renders a
+ *   proper table. So:
+ *
+ *     - Displayed bubble: `| Name | Age |` (rendered as a table)
+ *     - TTS speaks: "Table. Columns: Name, Age. Name Alice, Age 30."
+ *
+ *   This satisfies both requirements:
+ *     1. Tables render correctly in the bubble (hyphens preserved)
+ *     2. TTS doesn't read pipes/hyphens verbatim
+ *
+ * PIPELINE:
  *   - Detect markdown tables (lines starting and ending with |)
  *   - Drop the separator row (the |---|---| line)
  *   - Convert each data row to "Name Alice, Age 30" style phrasing
@@ -51,18 +67,30 @@ package com.handyai.tts
  *   - Bullet markers (-, *, •) at line starts → "Item: ..."
  *   - URL brackets [text](url) → just "text"
  *   - Triple backticks ``` (code fence) → skip
+ *   - SmolLM-style XML/HTML tags (`<response>`, `<answer>`) → stripped
+ *     (kept in sync with MarkdownParser.sanitize's tag handling)
  */
 object TtsSpeechSanitizer {
 
     /**
      * Sanitize [text] for speech. Returns a string suitable for passing
-     * to TextToSpeech.speak() — no markdown syntax, no pipes, no hashes.
+     * to TextToSpeech.speak() — no markdown syntax, no pipes, no hashes,
+     * no XML/HTML tags.
      */
     fun sanitize(text: String): String {
         if (text.isBlank()) return text
 
+        // ── Step 0: Strip XML/HTML-style tags (SmolLM fix, v1.4.2) ──────
+        // SmolLM and other tiny models sometimes wrap output in tags like
+        // `<response>...</response>`. TTS would read "less than response
+        // greater than" verbatim. Strip the tags but keep the content.
+        var stripped = text
+        if (stripped.contains('<')) {
+            stripped = stripped.replace(Regex("<\\/?[a-zA-Z][a-zA-Z0-9]*(?:\\s[^<>]*?)?\\/?>"), "")
+        }
+
         // ── Step 1: Extract markdown tables and convert to spoken text ──
-        val lines = text.split('\n')
+        val lines = stripped.split('\n')
         val out = StringBuilder()
         var i = 0
         while (i < lines.size) {
@@ -107,6 +135,11 @@ object TtsSpeechSanitizer {
         result = result.replace(Regex("!\\[([^\\]]+)\\]\\([^)]+\\)"), "$1")
 
         // Bullet markers at line start: - item / * item / • item → item
+        // NOTE: This only strips bullets that begin a line. Hyphens INSIDE
+        // a table cell (e.g. "| well-known | example |") were already
+        // handled by tableToSpeech above. Hyphens in the table SEPARATOR
+        // row (|---|---|) were dropped by tableToSpeech. So this regex
+        // won't touch table content — it only catches standalone bullets.
         result = result.replace(Regex("^\\s*[-*•]\\s+", RegexOption.MULTILINE), "")
 
         // Numbered list markers: 1. item → item
@@ -159,6 +192,10 @@ object TtsSpeechSanitizer {
      *   Columns: Name, Age. Alice, 30. Bob, 25.
      *
      * If there's no separator row, treat the first row as headers anyway.
+     *
+     * v1.4.2 hardening: handles malformed separator rows (e.g. with stray
+     * spaces or colons for alignment), tables with only headers (no body),
+     * and tables where the cell count varies between rows.
      */
     private fun tableToSpeech(tableLines: List<String>): String {
         if (tableLines.isEmpty()) return ""
@@ -167,9 +204,11 @@ object TtsSpeechSanitizer {
         val rows = tableLines.map { parseRow(it) }.filter { it.isNotEmpty() }
         if (rows.isEmpty()) return ""
 
-        // Detect and skip separator row (the |---|---| line)
+        // Detect and skip separator row (the |---|---| line). A separator
+        // cell is one that contains ONLY hyphens, colons, or whitespace
+        // (colons are used for alignment: |:---|, |---:|, |:---:|).
         val dataRows = rows.filterNot { row ->
-            row.all { cell -> cell.isBlank() || Regex("^[\\-:]+$").matches(cell.trim()) }
+            row.all { cell -> cell.isBlank() || Regex("^[\\-:\\s]+$").matches(cell.trim()) }
         }
         if (dataRows.isEmpty()) return ""
 
@@ -185,7 +224,7 @@ object TtsSpeechSanitizer {
         }
         // Read each data row
         body.forEach { row ->
-            // Pad row to header length
+            // Pad row to header length (handles rows with fewer cells)
             val padded = row + List(maxOf(0, headers.size - row.size)) { "" }
             val pairs = headers.zip(padded)
                 .filter { (_, v) -> v.isNotBlank() }
@@ -206,6 +245,9 @@ object TtsSpeechSanitizer {
         // Strip leading/trailing pipe
         if (s.startsWith("|")) s = s.substring(1)
         if (s.endsWith("|")) s = s.substring(0, s.length - 1)
+        // Split on literal | (Kotlin's String.split(String) treats the
+        // delimiter literally, NOT as regex — so this correctly splits on
+        // the pipe character, not the regex alternation operator).
         return s.split("|").map { it.trim() }
     }
 }

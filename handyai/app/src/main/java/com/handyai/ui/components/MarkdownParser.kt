@@ -58,42 +58,100 @@ package com.handyai.ui.components
  * `text.length == layout.text.length` is invariant — the caret
  * positioning in [StreamingBubble] can never go out of bounds.
  *
- * WHAT REMAINS
- * ============
- * Only [sanitize] — the `\n` escape cleanup. Small on-device models
- * sometimes emit the two-character sequence `\` + `n` instead of an
- * actual newline character (they're trying to format their output but
- * haven't learned that the escape only works inside source code). The
- * user sees "Here is the summary:\n- Point one" as a single run-on
- * line with visible `\n` markers. [sanitize] converts those literal
- * sequences into real newlines so the text reads naturally.
+ * WHAT REMAINS (v1.4.2)
+ * =====================
+ * Only [sanitize] — which now performs FOUR passes:
+ *
+ *   1. **Tag stripping** (v1.4.2 — SmolLM fix): SmolLM-135M and
+ *      similar tiny models often wrap their output in XML/HTML-style
+ *      tags like `<response>...</response>`, `<thought>...</thought>`,
+ *      `<answer>...</answer>`. The user sees these raw tags in the
+ *      chat bubble, which looks broken. This pass strips the tags but
+ *      KEEPS the content inside them, so `<answer>Hello</answer>`
+ *      becomes `Hello`.
+ *
+ *      Tags are stripped in REALTIME as chunks stream in — this
+ *      function is called on every chunk in ChatViewModel. A chunk
+ *      may arrive as `<ans` then `wer>Hel` then `lo</answer>` — the
+ *      regex handles partial tags by leaving incomplete `<` sequences
+ *      untouched (they'll be cleaned up on the next chunk once the
+ *      full tag arrives).
+ *
+ *   2. **Escape-sequence cleanup** (v1.2.9 — original): small on-device
+ *      models sometimes emit the two-character sequence `\` + `n`
+ *      instead of an actual newline character. This pass converts
+ *      those literal `\n` sequences into real newlines so the text
+ *      reads naturally.
+ *
+ *   3. **Carriage return removal** (v1.4.2 — user-requested): the
+ *      user asked "remove \r or \n from llm reply". We interpret this
+ *      as: strip literal `\r` escape sequences (backslash + r) AND
+ *      actual `\r` control characters (Windows line endings). Actual
+ *      `\n` newline characters are KEPT — they're needed for paragraph
+ *      breaks, list formatting, and markdown tables. Without them the
+ *      bubble would render as a single run-on line.
+ *
+ *   4. **Markdown table preservation**: pipes (`|`) and hyphens (`-`)
+ *      are NOT stripped — they're needed for table rendering in
+ *      [MarkdownTable]. The TTS path has its own sanitizer
+ *      ([com.handyai.tts.TtsSpeechSanitizer]) that converts tables to
+ *      spoken prose without affecting the displayed text.
+ *
+ * Applied to:
+ *   - Each streaming chunk in ChatViewModel (live)
+ *   - The final response before persisting to the DB
+ *   - As a defensive render-time pass in MessageBubble / StreamingBubble
  */
 object MarkdownParser {
 
     /**
-     * Sanitize LLM output by replacing literal backslash-n sequences with
-     * actual newline characters.
+     * Sanitize LLM output for display.
      *
-     * Small on-device models (Qwen 0.5B–1.5B, SmolLM, Phi-4-mini) sometimes
-     * emit the two-character sequence `\` + `n` instead of an actual newline
-     * character — they're trying to format their output but haven't learned
-     * that the escape only works inside source code, not in chat text. The
-     * user sees "Here is the summary:\n- Point one\n- Point two" rendered
-     * as a single run-on line with visible `\n` markers.
-     *
-     * This function converts those literal sequences into real newlines so
-     * the text reads naturally. It's applied:
-     *   - To each streaming chunk in ChatViewModel (live)
-     *   - To the final response before persisting to the DB
-     *   - As a defensive render-time pass in MessageBubble / StreamingBubble
-     *
-     * NOTE: only handles `\n` (the most common offender). `\t` and `\r`
-     * are rarer and not stripped — the LLM almost never emits them as
-     * literal escapes in chat output.
+     * See class kdoc for the full breakdown of the four passes.
      */
     fun sanitize(text: String): String {
         if (text.isEmpty()) return text
-        if (!text.contains('\\')) return text  // fast path: no backslashes = no escapes
-        return text.replace("\\n", "\n")
+
+        var result = text
+
+        // ── Pass 1: Strip XML/HTML-style tags (SmolLM fix, v1.4.2) ──────
+        // Only strip if the chunk contains a '<' that looks like it could
+        // be the start of a tag. The regex matches complete tags like
+        // `<response>`, `</response>`, `<thought lang="en">`. INCOMPLETE
+        // tags (just `<` at the end of a chunk, waiting for the rest) are
+        // left alone — they'll be caught on the next chunk once the full
+        // tag arrives.
+        //
+        // We deliberately do NOT strip tags whose name starts with a digit
+        // or non-letter (e.g. `<3`, `<5px`) to avoid eating math/emojis.
+        if (result.contains('<')) {
+            result = result.replace(Regex("<\\/?[a-zA-Z][a-zA-Z0-9]*(?:\\s[^<>]*?)?\\/?>"), "")
+        }
+
+        // ── Pass 2: Convert literal `\n` escapes to real newlines ───────
+        // Small on-device models sometimes emit `\` + `n` as two characters
+        // instead of an actual newline. This is the original v1.2.9 fix.
+        if (result.contains('\\')) {
+            // Convert literal \n → real newline
+            result = result.replace("\\n", "\n")
+            // Remove literal \r escape (user asked: "remove \r from llm reply")
+            // We REMOVE (not convert) because a literal \r in chat output is
+            // never useful — it would just show as a stray "r" after the
+            // backslash is processed.
+            result = result.replace("\\r", "")
+            // Also handle literal \t → real tab (defensive, rare)
+            result = result.replace("\\t", "\t")
+        }
+
+        // ── Pass 3: Remove actual \r control characters ─────────────────
+        // Windows-style line endings (\r\n) become just \n. Lone \r (old
+        // Mac Classic line endings, or stray carriage returns) are removed
+        // entirely. Actual \n newlines are PRESERVED — they're needed for
+        // paragraph breaks, list formatting, and markdown tables.
+        if (result.contains('\r')) {
+            result = result.replace("\r\n", "\n").replace("\r", "")
+        }
+
+        return result
     }
 }

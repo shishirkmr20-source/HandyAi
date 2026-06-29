@@ -1265,15 +1265,26 @@ class ChatViewModel(
         /**
          * Max chars of file/image content to inline into the user message.
          *
-         * Increased from 1800→3000 (file) and 1000→1500 (image) in v1.2.2
-         * because we now use a MINIMAL system prompt when a file is attached
-         * (no habit/journal/web context), freeing up context window space.
+         * v1.4.2: IMAGE budget raised from 1500 → 3500 (matches FILE).
+         * The user reported: "while extracting the text from image it is
+         * not able to extract full text which it was able to do so before".
+         * Root cause: ML Kit OCR was correctly extracting 3000-8000 chars
+         * from screenshots / scanned documents, but buildInlineUserMessage
+         * was truncating to 1500 chars before passing to the LLM — so the
+         * model only saw the first ~25 lines of a long screenshot. Raising
+         * the budget to 3500 lets the model see the same amount of image
+         * OCR text as it would see from a document attachment.
+         *
+         * v1.2.2 notes (kept for history):
+         *   Increased from 1800→3000 (file) and 1000→1500 (image) because
+         *   we now use a MINIMAL system prompt when a file is attached
+         *   (no habit/journal/web context), freeing up context window space.
          *
          * Larger files (>2000 chars) triggered by a summarize request go
          * through map-reduce instead — see [SUMMARIZE_MAPREDUCE_THRESHOLD].
          */
-        private const val SMALL_MODEL_INLINE_BUDGET_FILE = 3000
-        private const val SMALL_MODEL_INLINE_BUDGET_IMAGE = 1500
+        private const val SMALL_MODEL_INLINE_BUDGET_FILE = 3500
+        private const val SMALL_MODEL_INLINE_BUDGET_IMAGE = 3500
 
         /**
          * Files longer than this (in chars) trigger map-reduce
