@@ -61,14 +61,12 @@ class ModelDownloader(private val context: Context) {
     /**
      * Local file path for a downloaded model.
      *
-     * Uses `.litertlm` extension for VISION_LITERTLM models (so LiteRT-LM
-     * can identify them) and `.task` for everything else (MediaPipe).
-     * The auto-loader dispatches by this extension.
+     * v1.4.5: All downloadable models are MediaPipe `.task` files now that
+     * the FastVLM `.litertlm` entry has been removed (the LiteRT-LM runtime
+     * crashed natively). Image understanding is a cloud-only pipeline —
+     * see ModelCatalog.kt and CloudImageAnalyzer.kt.
      */
-    fun localPath(spec: ModelSpec): File {
-        val ext = if (spec.modelType == ModelType.VISION_LITERTLM) ".litertlm" else ".task"
-        return File(modelDir(), "${spec.id}$ext")
-    }
+    fun localPath(spec: ModelSpec): File = File(modelDir(), "${spec.id}.task")
 
     fun isDownloaded(spec: ModelSpec): Boolean = isValidModelFile(localPath(spec))
 

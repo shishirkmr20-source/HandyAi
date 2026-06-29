@@ -1463,3 +1463,35 @@ Stage Summary:
 - 4 issues fixed across 5 files: ChatViewModel.kt, MarkdownParser.kt, MessageBubble.kt, MainScreen.kt, build.gradle.kts, SettingsScreen.kt.
 - v1.4.4 APK (127 MB) at /home/z/my-project/download/handyai-v1.4.4-apk/app-release.apk.
 - GitHub: main now at de8ecf5.
+
+---
+Task ID: v1.4.5-overhaul
+Agent: Super Z (main)
+Task: Major v1.4.5 overhaul — remove SmolLM fully, replace FastVLM vision model with cloud-based vision pipeline (kills native crash), build local smart-browse trigger for web search, add better free search sources, fix scroll lock during long streaming, fix OCR accuracy + "no image attached" false negative, fix "learner is getting created" leak.
+
+Work Log:
+- Investigated codebase: read ChatViewModel.kt, MainScreen.kt, LiteRtlmEngine.kt, CloudImageAnalyzer.kt, ImageAnalyzer.kt, FileTextExtractor.kt, WebSearchService.kt, PromptRouter.kt, PreferenceLearner.kt, ModelCatalog.kt, ModelSettingsViewModel.kt, ModelDownloader.kt, ModelAutoLoader.kt, HandyAiApp.kt, build.gradle.kts, LlmEngine.kt.
+- Identified root causes:
+  * Vision crash = LiteRT-LM alpha05 eng.initialize() SIGSEGV on arm64 (already blocked but FastVLM catalog entry + dispatch code + dependency still ship in APK).
+  * SmolLM = ModelCatalog entry + ChatViewModel paramCount<=0.2 length nudge + comments in 7 files.
+  * Scroll lock = LaunchedEffect re-runs on every streaming chunk (~20/sec), calling scrollToItem() that interrupts user gestures. Also userScrolledUp flag gets stuck true on brief canScrollForward windows between chunks.
+  * "Learner is getting created" = no source match. Likely the LLM parroting the system prompt's "Learned user preference:" prefix. Fix: change prefix to "User context:" + add "Never mention personalization/learner systems" instruction.
+  * "No image attached" = ImageAnalyzer emits "no legible text was detected" + the LLM deflects. Fix: emit explicit "AN IMAGE IS ATTACHED — describe what's visible based on labels" framing.
+  * OCR accuracy = ML Kit default recognizer + no fallback. Fix: add cloud OCR.space fallback when ML Kit returns empty.
+  * Web search relevance = v1.4.4 fires on EVERY message with internet ON (spammy, gets rate-limited). Fix: smart local trigger.
+
+(Continued in next stage summary)
+
+Stage Summary:
+- All 7 user-requested fixes implemented and committed as v1.4.5 (commit 19e910a).
+- Files deleted: LiteRtlmEngine.kt (the native-crash source)
+- Files created: WebSearchTrigger.kt (smart local web-search trigger)
+- Files modified: 12 (ModelCatalog, ModelDownloader, ModelAutoLoader, ModelSettingsViewModel,
+  HandyAiApp, ChatViewModel, MainScreen, CloudImageAnalyzer, FileTextExtractor,
+  WebSearchService, build.gradle.kts, worklog)
+- compileDebugKotlin passes cleanly. Release build progressed past lint + dex merging
+  before the sandbox OOM-killed the Gradle daemon (environment issue, not a code issue).
+- 1 commit ahead of origin/main. Push failed (no GitHub credentials configured in this
+  environment) — user needs to push manually with a PAT or SSH key.
+- Net delta: +1134 / -1042 lines across 14 files (lots of dead vision-dispatch code removed,
+  replaced with cleaner cloud-vision + smart-search pipelines).

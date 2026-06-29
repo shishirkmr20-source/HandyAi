@@ -52,7 +52,6 @@ class ChatViewModel(
     private val chatId: Long,
     private val chatRepo: ChatRepository,
     private val llm: LlmEngine,
-    private val liteRtlm: com.handyai.llm.LiteRtlmEngine,
     private val imageGen: com.handyai.llm.ImageGenEngine,
     private val tts: TtsEngine,
     private val settings: SettingsRepository,
@@ -137,7 +136,6 @@ class ChatViewModel(
         // Dispatchers.Default and propagate the StateFlow update back to
         // Main (a dispatcher round-trip that makes Stop feel sluggish).
         llm.markReady()
-        liteRtlm.markReady()
         // ── v1.4.3: CLEAR STREAMING CHUNK SYNCHRONOUSLY ──────────────
         // Previously, _streamingChunk was only cleared at the END of the
         // sendUserMessage coroutine (line 619). But that coroutine is now
@@ -192,50 +190,17 @@ class ChatViewModel(
             android.util.Log.i("HandyAi/ChatVM",
                 "attachFile: chatId=$chatId, uri=$uri, displayName=$displayName")
 
-            // ── VISION-MODEL FAST PATH (v1.4.0) ──────────────────────────
-            // When a LiteRT-LM vision model (FastVLM) is the active engine,
-            // image attachments are passed DIRECTLY to the model — no OCR,
-            // no ML Kit labels, no cloud BLIP. The model's vision encoder
-            // reads the pixels and produces a real natural-language answer.
+            // v1.4.5: Vision-model fast path REMOVED. The LiteRT-LM runtime
+            // (FastVLM) has been deleted — vision is now a cloud-only pipeline
+            // (BLIP-large caption + ML Kit OCR + ML Kit labels + OCR.space
+            // fallback) wired through FileTextExtractor. Every image attachment
+            // goes through the regular extract() path below; the result is
+            // inlined into the user's next message for the text LLM to read.
             //
-            // We detect "is image" by MIME type / extension here (without
-            // running the full extractor) and store a vision:// URI marker
-            // on the chat row instead of extracted text. sendUserMessage
-            // sees this marker and dispatches to liteRtlm.generateReplyStream
-            // with the imageUri parameter.
-            val isProbablyImage = displayName.matches(Regex(".*\\.(jpe?g|png|webp|bmp|gif)$", RegexOption.IGNORE_CASE))
-            if (liteRtlm.isModelLoaded() && isProbablyImage) {
-                // Copy the image into app-private storage so the Uri
-                // persists even after the original ContentResolver Uri
-                // becomes invalid (e.g. user revokes the picker grant).
-                val app = com.handyai.HandyAiApp.instance
-                val visionDir = java.io.File(app.filesDir, "vision_attachments").apply { mkdirs() }
-                val safeName = "${System.currentTimeMillis()}_${displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")}"
-                val destFile = java.io.File(visionDir, safeName)
-                try {
-                    resolver.openInputStream(uri)?.use { input ->
-                        destFile.outputStream().use { output -> input.copyTo(output) }
-                    } ?: run {
-                        _errors.send("Could not open image file")
-                        return
-                    }
-                } catch (t: Throwable) {
-                    _errors.send("Could not copy image: ${t.message}")
-                    return
-                }
-                val visionUri = "vision://${destFile.absolutePath}"
-                val label = "image:$displayName"
-                android.util.Log.i("HandyAi/ChatVM",
-                    "attachFile (vision fast path): stored $destFile (${destFile.length()} bytes), " +
-                    "label=$label — will be passed natively to FastVLM")
-                chatRepo.setContext(chatId, visionUri, label)
-                return
-            }
-
-            // When the user has internet enable, pass preferCloud=true so
-            // image attachments get a real cloud vision description (BLIP)
-            // instead of just ML Kit labels. Documents always use the
-            // on-device extractors (PDFBox, POI) — they're already excellent.
+            // When the user has internet enabled, pass preferCloud=true so
+            // image attachments get a real cloud vision description (BLIP-large)
+            // AND cloud OCR fallback (OCR.space) when ML Kit returns empty.
+            // Documents always use the on-device extractors (PDFBox, POI).
             val preferCloud = internetEnabled.value
             val result = withContext(Dispatchers.IO) { fileExtractor.extract(uri, displayName, preferCloud = preferCloud) }
             val label = if (result.charsTruncated) "${result.label} (truncated)" else result.label
@@ -432,39 +397,11 @@ class ChatViewModel(
         //      re-attach the file if they want another Q about it).
         val fileContext: Pair<String, Boolean>? = fileContextSnapshot
 
-        // 3.55a) VISION-MODEL DISPATCH (v1.4.0)
-        //
-        // If a LiteRT-LM vision model (FastVLM) is the active engine AND
-        // the user just attached an image, dispatch to LiteRtlmEngine
-        // directly — bypassing the MediaPipe path entirely. The image is
-        // passed as native pixels to the model's vision encoder.
-        //
-        // The chat row's context field stores a "vision://<path>" marker
-        // (set by attachFile's vision fast path). We parse out the file
-        // path, build a Uri, and pass it to liteRtlm.generateReplyStream.
-        //
-        // If the vision model is active but the attachment is NOT an image
-        // (e.g. a PDF), we fall through to the regular MediaPipe-style
-        // path — but the LiteRT-LM engine will be used for the LLM call
-        // anyway via the dispatch in step 5 below (TODO: not yet wired —
-        // currently the MediaPipe engine will be used since liteRtlm is
-        // only invoked here for image attachments).
-        if (liteRtlm.isModelLoaded() && fileContext != null && fileContext.second) {
-            val rawContext = fileContext.first
-            if (rawContext.startsWith("vision://")) {
-                val imagePath = rawContext.removePrefix("vision://")
-                val imageFile = java.io.File(imagePath)
-                if (imageFile.exists()) {
-                    android.util.Log.i("HandyAi/ChatVM",
-                        "Vision dispatch: FastVLM active + image attached → liteRtlm.generateReplyStream")
-                    handleVisionReply(text, Uri.fromFile(imageFile))
-                    return@launch
-                } else {
-                    android.util.Log.w("HandyAi/ChatVM",
-                        "Vision file no longer exists: $imagePath — falling back to text-only")
-                }
-            }
-        }
+        // v1.4.5: Vision-model dispatch REMOVED. The LiteRT-LM runtime
+        // (FastVLM) is gone — image attachments now flow through the regular
+        // text-LLM path with the image's analyzed content (ML Kit OCR +
+        // labels + cloud BLIP-large caption + OCR.space fallback) inlined
+        // into the user's message by buildInlineUserMessage below.
 
         // 3.55) MAP-REDUCE SUMMARIZATION FOR LARGE FILES
         //
@@ -728,8 +665,6 @@ class ChatViewModel(
         // gets a graduated nudge calibrated to its capability.
         val paramCount = llm.activeModelParamCount() ?: 0.0
         val lengthNudge = when {
-            paramCount <= 0.2 ->  // SmolLM 135M and smaller
-                "DEFAULT LENGTH: SHORT. Reply in 1-3 sentences unless the user explicitly asks for detail, code, lists, or step-by-step explanations. Be precise — no filler, no preamble."
             paramCount <= 0.7 ->  // Qwen 0.5B
                 "Be concise. Reply briefly unless the user asks for detail."
             paramCount <= 1.5 ->  // Qwen 1.5B
@@ -758,7 +693,7 @@ class ChatViewModel(
         // tell the model to actually read the inlined content.
         val fileBlock = if (hasFile) {
             if (isImage) {
-                "The user attached an image. Its analyzed content (visible text + detected objects) is in your latest user message between 'Image content:' and 'Question:'. Read it and answer based on it. Do not say you cannot see images."
+                "AN IMAGE IS ATTACHED to this message. Its analyzed content (visible OCR text + detected objects + cloud-vision caption) is inlined in your latest user message between 'Image content:' and 'Question:'. Read it carefully and answer based on it. NEVER say you cannot see images, never say no image is attached, never claim the image is missing — the content is right there in the message. If the OCR text is empty, describe what's visible based on the detected-object labels and cloud caption."
             } else {
                 "The user attached a document. Its extracted text is in your latest user message between 'Document content:' and 'Question:'. Read it carefully and answer based on it. Do not say you cannot read files. Quote from the extracted text to prove you read it."
             }
@@ -783,17 +718,27 @@ class ChatViewModel(
             }.trim()
         } else ""
 
-        // ── 8. WEB SEARCH (v1.4.4: run whenever internet is ON) ───────
-        // Previously this was gated on `routed.matchedRules.any { it.id == "web_search" }`,
-        // which only fired for freshness keywords ("latest", "news", "weather").
-        // Common factual questions matched no rule → no web search ran,
-        // even with internet ON. The user reported "LLMs are not able to
-        // fetch data from internet properly — it used to work fine earlier."
+        // ── 8. WEB SEARCH (v1.4.5: SMART LOCAL TRIGGER) ───────
+        // v1.4.4 ran web search on EVERY message with internet ON, which
+        // spammed DuckDuckGo/Bing and got rate-limited. v1.4.5 introduces
+        // WebSearchTrigger — a pure local classifier that returns true
+        // ONLY when the user's message genuinely needs fresh data
+        // (freshness cues, explicit dates, news/events, live data like
+        // weather/stocks/scores, explicit "search for" asks, or
+        // "who is the current X" queries).
         //
-        // Fix: run web search whenever internet is enabled, regardless of
-        // the PromptRouter's classification. ContextCache dedupes recent
-        // queries (5-min TTL) so this doesn't spam the network.
-        val webCtx = if (internetEnabled.value) {
+        // The classifier runs in microseconds (regex + keyword scan, no
+        // LLM call). When it returns false, the LLM answers from its
+        // own training data — no network round-trip, no rate-limit risk,
+        // faster reply.
+        //
+        // ContextCache still dedupes (5-min TTL) so re-asking the same
+        // fresh question twice in 5 minutes doesn't re-hit the network.
+        val webDecision = com.handyai.llm.WebSearchTrigger.classify(userText)
+        val webCtx = if (internetEnabled.value && webDecision.shouldSearch) {
+            android.util.Log.i("HandyAi/ChatVM",
+                "Web search triggered: category=${webDecision.matchedCategory}, " +
+                "trigger='${webDecision.matchedTrigger}', query='${userText.take(60)}'")
             _statusText.value = "Searching the web…"
             try {
                 val cached = contextCache.getWebResult(userText)
@@ -815,13 +760,25 @@ class ChatViewModel(
         } else ""
 
         // ── ASSEMBLE ──────────────────────────────────────────────────
+        // v1.4.5: "Learned user preference:" prefix changed to "User context:"
+        // because small models were parroting it back as "the learner is
+        // getting created" / "learner is being initialized" etc. The new
+        // prefix is neutral and doesn't hint at any personalization system.
+        //
+        // Also added an explicit "never mention personalization / learner /
+        // preference systems" instruction to the base prompt — kills the
+        // "learner is getting created" leak for good.
         val sb = StringBuilder()
         sb.append(com.handyai.llm.PromptRouter.buildSystemPrompt(routed, habitCreatedName, journalCreatedTitle))
+        // v1.4.5: anti-leak instruction — never mention the preference/
+        // learner/personalization system to the user. Treat all hints as
+        // your own knowledge.
+        sb.append("\n\nNever mention personalization, preference, learner, or adaptation systems to the user. Treat all user-context hints as your own knowledge.")
         if (lengthNudge.isNotBlank()) {
             sb.append("\n\n").append(lengthNudge)
         }
         if (prefHint.isNotBlank()) {
-            sb.append("\n\nLearned user preference: ").append(prefHint)
+            sb.append("\n\nUser context: ").append(prefHint)
         }
         if (correctionBlock.isNotBlank()) {
             sb.append("\n\n").append(correctionBlock)
@@ -1154,65 +1111,13 @@ class ChatViewModel(
         return triggers.any { lower.contains(it) }
     }
 
-    /**
-     * Run a vision-aware reply via the LiteRT-LM engine. The user's text
-     * and the attached image are sent to the model together; the model's
-     * vision encoder reads the pixels and produces a natural-language
-     * answer that references what's in the image.
-     *
-     * Used ONLY when a LiteRT-LM vision model (FastVLM) is the active
-     * engine AND the user attached an image to this message. For text-
-     * only messages or document attachments, the regular MediaPipe path
-     * is used (or, if FastVLM is active, the LiteRT-LM engine with a
-     * text-only message).
-     *
-     * Streaming: LiteRT-LM alpha05 doesn't expose true token streaming
-     * via the public API, so the engine does a sync `sendMessage` call
-     * internally then fake-types the response word-by-word. The user
-     * sees a "Vision model thinking…" status during generation, then
-     * the reply appears with a brief typing effect.
-     */
-    private suspend fun handleVisionReply(userText: String, imageUri: Uri) {
-        _streamingChunk.value = ""
-        _statusText.value = "Vision model analyzing image…"
-        currentGenJob = coroutineContext[Job]
-        try {
-            val result = liteRtlm.generateReplyStream(userText, imageUri) { chunk ->
-                _streamingChunk.value += com.handyai.ui.components.MarkdownParser.sanitize(chunk)
-            }
-            val isCancellation = result.isFailure &&
-                result.exceptionOrNull() is kotlinx.coroutines.CancellationException
-            val partial = _streamingChunk.value
-            if (isCancellation && partial.isBlank()) {
-                android.util.Log.i("HandyAi/ChatVM", "Vision reply stopped by user (no partial text)")
-            } else {
-                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                    result.onSuccess { full ->
-                        val sanitized = com.handyai.ui.components.MarkdownParser.sanitize(full)
-                        val final = if (sanitized.isBlank()) partial.ifBlank { "(no response from vision model)" } else sanitized
-                        chatRepo.appendMessage(chatId, Role.ASSISTANT, final)
-                        if (ttsEnabled.value) {
-                            tts.speak(final, "auto-${System.currentTimeMillis()}")
-                        }
-                    }.onFailure { err ->
-                        if (isCancellation && partial.isNotBlank()) {
-                            chatRepo.appendMessage(chatId, Role.ASSISTANT, partial)
-                            android.util.Log.i("HandyAi/ChatVM",
-                                "Vision reply stopped by user, persisted partial: ${partial.length} chars")
-                        } else {
-                            val msg = err.message ?: err.javaClass.simpleName ?: "Vision model failed"
-                            _errors.send(msg)
-                            chatRepo.appendMessage(chatId, Role.ASSISTANT, "⚠️ $msg", isError = true)
-                        }
-                    }
-                }
-            }
-        } finally {
-            _statusText.value = ""
-            _streamingChunk.value = ""
-            currentGenJob = null
-        }
-    }
+    // v1.4.5: handleVisionReply() REMOVED. The LiteRT-LM vision runtime has
+    // been deleted from the project (native crash on arm64). Image attachments
+    // now flow through the regular text-LLM path: FileTextExtractor produces
+    // a combined "image content" string (ML Kit OCR + labels + cloud BLIP-large
+    // caption + OCR.space fallback), which buildInlineUserMessage splices into
+    // the user's message. The text LLM then answers based on that content.
+    // No separate vision reply path needed.
 
     /**
      * Run map-reduce summarization on [fileText] and stream the result
@@ -1356,7 +1261,6 @@ class ChatViewModelFactory(
     private val chatId: Long,
     private val chatRepo: ChatRepository,
     private val llm: LlmEngine,
-    private val liteRtlm: com.handyai.llm.LiteRtlmEngine,
     private val imageGen: com.handyai.llm.ImageGenEngine,
     private val tts: TtsEngine,
     private val settings: SettingsRepository,
@@ -1370,7 +1274,7 @@ class ChatViewModelFactory(
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        ChatViewModel(chatId, chatRepo, llm, liteRtlm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache) as T
+        ChatViewModel(chatId, chatRepo, llm, imageGen, tts, settings, fileExtractor, webSearch, journalRepo, habitRepo, summarizer, preferenceLearner, contextCache) as T
 }
 
 /**

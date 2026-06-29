@@ -43,14 +43,9 @@ class HandyAiApp : Application() {
     val habitRepository by lazy { com.handyai.data.repo.HabitRepository(database.habitDao()) }
     val settingsRepository by lazy { SettingsRepository(this) }
     val llmEngine by lazy { LlmEngine(this) }
-    /**
-     * LiteRT-LM engine — runs `.litertlm` vision-language models
-     * (e.g. Apple FastVLM-0.5B). Parallel to [llmEngine] (which wraps
-     * MediaPipe and runs `.task` text-only models). The ChatViewModel
-     * dispatches to whichever engine matches the active model's file
-     * extension. See [LiteRtlmEngine] class kdoc for the rationale.
-     */
-    val liteRtlmEngine by lazy { com.handyai.llm.LiteRtlmEngine(this) }
+    /** v1.4.5: LiteRT-LM engine removed. The on-device vision runtime
+     *  crashed natively on arm64; vision is now a cloud-only pipeline
+     *  (BLIP-large + OCR.space + ML Kit) — see CloudImageAnalyzer.kt. */
     /** On-device text-to-image engine (Stable Diffusion 1.5 via MediaPipe
      *  Image Generator). Separate from [llmEngine] — the two tasks use
      *  different .task file formats and cannot share a session. */
@@ -137,7 +132,7 @@ class HandyAiApp : Application() {
         // manually unload + reload every time they reopen the app.
         // Image generation is now cloud-based (Pollinations.ai) and
         // doesn't need auto-loading.
-        com.handyai.llm.ModelAutoLoader.autoLoad(this, llmEngine, liteRtlmEngine, settingsRepository)
+        com.handyai.llm.ModelAutoLoader.autoLoad(this, llmEngine, settingsRepository)
     }
 
     companion object {

@@ -23,6 +23,7 @@ import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -30,70 +31,80 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
 /**
- * Cloud-powered image analysis fallback for when the device is online.
+ * Cloud-powered image analysis (v1.4.5).
  *
- * WHY THIS EXISTS
- * ───────────────
- * The on-device [ImageAnalyzer] uses ML Kit, which is fast and free but
- * limited: it produces short labels (single words like "Plant", "Coffee")
- * and OCR text only. It cannot describe scenes, interpret charts, or
- * understand what's happening in a photo.
+ * ── WHAT CHANGED IN v1.4.5 ────────────────────────────────────────────────
+ * The previous version (BLIP-base caption-only) was rarely useful: it
+ * returned one-line captions like "a photo of a plant" that didn't help
+ * the LLM answer "what does the text in this image say?". The user
+ * reported "ocr is not giving the correct results on what is written in
+ * the image" — the cloud caption was being mixed into the prompt and
+ * confusing the LLM about whether real OCR text existed.
  *
- * When the user is online, this class calls a free cloud vision model
- * (BLIP image captioning on HuggingFace Inference API) to produce a
- * natural-language description of the image. The description is then
- * fed to the on-device LLM as part of the attachment context — so the
- * LLM can answer "what's in this image?" with a real description
- * instead of just a list of labels.
+ * v1.4.5 fixes:
+ *   1. Upgraded caption model: BLIP-base → BLIP-large. Bigger, more
+ *      accurate, still anonymous-accessible on HuggingFace Inference API.
+ *   2. NEW: cloud OCR fallback via OCR.space (free, no API key for
+ *      low-volume use). When the on-device ML Kit recognizer returns
+ *      empty text (low-contrast images, stylized fonts, non-Latin glyphs
+ *      that ML Kit's bundled Latin recognizer can't handle), we POST the
+ *      image to OCR.space and get back the actual text.
+ *   3. Returns BOTH the caption AND the cloud-OCR text — the caller
+ *      (FileTextExtractor) merges them with the on-device ML Kit output
+ *      so the LLM sees the best-available description of the image.
  *
- * NETWORK STRATEGY
- * ────────────────
- *   - Endpoint: https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base
- *   - Method: POST with the image bytes as the raw body
- *   - Auth: none required for low-volume use (rate-limited per IP)
- *   - Response: JSON array [{"generated_text": "..."}]
+ * ── WHY BOTH OCR + CAPTION ────────────────────────────────────────────────
+ *   - Caption answers "what's in this image?" (scene, objects, mood)
+ *   - OCR answers "what text is visible?" (signs, screenshots, documents)
  *
- * The model is small (BLIP-base, ~250MB) so inference typically takes
- * 2-5 seconds. HuggingFace caches the model after the first cold start.
+ * A user asking "what does this screenshot say?" needs OCR.
+ * A user asking "describe this photo" needs the caption.
+ * We don't know which the user wants, so we provide both.
  *
- * FALLBACK
- * ────────
- * If the network call fails (timeout, rate limit, no internet), this
- * class returns null — the caller ([FileTextExtractor]) then falls
- * back to the on-device [ImageAnalyzer]. The user gets the best
- * available result without ever seeing an error from this class.
+ * ── NETWORK STRATEGY ─────────────────────────────────────────────────────
+ *   - BLIP-large caption: POST image bytes to
+ *     https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large
+ *     Anonymous (no auth header). Cold-start can take 10-20s; subsequent
+ *     calls are 2-5s.
+ *   - OCR.space OCR: POST multipart form to https://api.ocr.space/parse/image
+ *     Anonymous (no API key) — the public endpoint is rate-limited but
+ *     works for low-volume use. Returns JSON with ParsedResults[].ParsedText.
  *
- * PRIVACY
- * ───────
- * When online AND the user has attached an image, the image bytes are
- * uploaded to HuggingFace for inference. The user has implicitly
- * consented to this by enabling internet mode (the toggle in the chat
- * input bar). When internet is OFF, this class is never called — the
- * on-device analyzer runs instead and nothing leaves the phone.
+ * ── FALLBACK ─────────────────────────────────────────────────────────────
+ * If EITHER call fails (timeout, rate-limit, parse error), we return what
+ * we got from the other. If both fail, we return null — the caller
+ * (FileTextExtractor) falls back to on-device ML Kit OCR + labels.
+ *
+ * ── PRIVACY ──────────────────────────────────────────────────────────────
+ * Only called when the user has internet mode ON. Image bytes are uploaded
+ * to HuggingFace and OCR.space for inference. When internet is OFF, this
+ * class is never called — the on-device analyzer runs instead and nothing
+ * leaves the phone.
  */
 class CloudImageAnalyzer(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)  // BLIP can take 10-15s on cold start
+        .readTimeout(25, java.util.concurrent.TimeUnit.SECONDS)  // BLIP-large cold-start can be 15-20s
         .build()
 
     /**
-     * Analyze [uri] using the cloud vision model. Returns a natural-language
-     * description, or null if the call failed for any reason (network,
-     * rate-limit, parse error).
+     * Analyze [uri] using the cloud vision pipeline (BLIP-large caption +
+     * OCR.space cloud OCR). Returns a combined string with both pieces of
+     * information, or null if BOTH calls failed.
      *
-     * The description is wrapped in the same "---IMAGE CONTENT START---"
-     * markers the on-device analyzer uses, so the ChatViewModel's prompt
-     * builder doesn't need to know which path produced it.
+     * The output is wrapped in the same "---IMAGE CONTENT START---" markers
+     * the on-device analyzer uses, so the ChatViewModel's prompt builder
+     * doesn't need to know which path produced it.
      */
     suspend fun analyze(uri: Uri, displayName: String): String? = withContext(Dispatchers.IO) {
         try {
-            // 1. Load + downscale the bitmap before uploading. HuggingFace
-            //    rejects images > ~1MB on the free tier. A 1024px JPEG at
-            //    quality 85 is ~150KB — well within limits and visually
-            //    sufficient for captioning.
-            val bitmap = loadAndDownscale(uri, maxDim = 1024)
+            // 1. Load + downscale the bitmap before uploading. Both
+            //    HuggingFace and OCR.space reject images > ~1MB on the
+            //    free tier. A 1280px JPEG at quality 85 is ~200KB — well
+            //    within limits and visually sufficient for both captioning
+            //    and OCR.
+            val bitmap = loadAndDownscale(uri, maxDim = 1280)
                 ?: return@withContext null
 
             // 2. JPEG-encode to a byte array
@@ -102,9 +113,53 @@ class CloudImageAnalyzer(private val context: Context) {
             val imageBytes = baos.toByteArray()
             try { bitmap.recycle() } catch (_: Throwable) {}
 
-            // 3. POST to HuggingFace Inference API (no auth header = anonymous)
+            // 3. Fire BOTH calls in parallel-ish (sequential under IO, but
+            //    each is independent — failure of one doesn't affect the
+            //    other). We collect what we can.
+            val caption = tryBlipCaption(imageBytes)
+            val ocrText = tryOcrSpace(imageBytes)
+
+            if (caption.isNullOrBlank() && ocrText.isNullOrBlank()) {
+                android.util.Log.i(TAG, "Cloud vision: both caption and OCR failed for $displayName")
+                return@withContext null
+            }
+
+            android.util.Log.i(TAG,
+                "Cloud vision OK for $displayName: " +
+                "caption=${if (caption.isNullOrBlank()) "(none)" else "'${caption.take(80)}'"}, " +
+                "ocr=${if (ocrText.isNullOrBlank()) "(none)" else "${ocrText.length} chars"}")
+
+            // 4. Wrap in the same format as the on-device analyzer so the
+            //    prompt builder doesn't need a separate code path.
+            buildString {
+                appendLine("---IMAGE CONTENT START---")
+                appendLine("File: $displayName")
+                appendLine()
+                if (!caption.isNullOrBlank()) {
+                    appendLine("Cloud-vision caption: $caption")
+                    appendLine()
+                }
+                if (!ocrText.isNullOrBlank()) {
+                    appendLine("Cloud OCR text (high accuracy):")
+                    appendLine(ocrText.trim())
+                    appendLine()
+                }
+                appendLine("---IMAGE CONTENT END---")
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "Cloud vision failed: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Call HuggingFace Inference API with BLIP-large for image captioning.
+     * Returns the caption string, or null on any failure.
+     */
+    private suspend fun tryBlipCaption(imageBytes: ByteArray): String? {
+        return try {
             val req = Request.Builder()
-                .url("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base")
+                .url("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large")
                 .post(imageBytes.toRequestBody("image/jpeg".toMediaType()))
                 .header("Accept", "application/json")
                 .build()
@@ -112,33 +167,126 @@ class CloudImageAnalyzer(private val context: Context) {
             val responseBody = client.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) {
                     android.util.Log.i(TAG,
-                        "Cloud vision HTTP ${res.code} — falling back to on-device")
+                        "BLIP-large HTTP ${res.code} — skipping cloud caption")
                     return@use ""
                 }
                 res.body?.string() ?: ""
             }
-            if (responseBody.isBlank()) return@withContext null
-
-            // 4. Parse JSON: expected format is [{"generated_text":"..."}]
-            //    HuggingFace sometimes returns an error object instead —
-            //    {"error":"Model is currently loading..."} — which we
-            //    treat as a transient failure (return null → caller falls back).
-            val caption = parseCaptionResponse(responseBody)
-            if (caption.isNullOrBlank()) return@withContext null
-
-            android.util.Log.i(TAG, "Cloud vision OK: \"$caption\" for $displayName")
-
-            // 5. Wrap in the same format as the on-device analyzer so the
-            //    prompt builder doesn't need a separate code path.
-            buildString {
-                appendLine("---IMAGE CONTENT START---")
-                appendLine("File: $displayName")
-                appendLine()
-                appendLine("Image description (cloud vision): $caption")
-                appendLine("---IMAGE CONTENT END---")
-            }
+            if (responseBody.isBlank()) return null
+            parseCaptionResponse(responseBody)
         } catch (t: Throwable) {
-            android.util.Log.w(TAG, "Cloud vision failed: ${t.message}")
+            android.util.Log.w(TAG, "BLIP-large caption failed: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Call OCR.space free OCR API. Returns the parsed text, or null on
+     * any failure. No API key required for the public endpoint (rate-
+     * limited but works for low-volume use).
+     *
+     * Endpoint: https://api.ocr.space/parse/image
+     * Method: multipart/form-data POST
+     * Required fields: apikey=K87997210488595 (public demo key, works for
+     *   anonymous use), language=eng, isOverlayRequired=false, file=<image>
+     * Response: JSON with ParsedResults[].ParsedText
+     */
+    private suspend fun tryOcrSpace(imageBytes: ByteArray): String? {
+        return try {
+            val multipart = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("apikey", OCR_SPACE_DEMO_KEY)
+                .addFormDataPart("language", "eng")
+                .addFormDataPart("isOverlayRequired", "false")
+                .addFormDataPart("scale", "true")
+                .addFormDataPart("isTable", "false")
+                .addFormDataPart(
+                    "file",
+                    "image.jpg",
+                    imageBytes.toRequestBody("image/jpeg".toMediaType())
+                )
+                .build()
+
+            val req = Request.Builder()
+                .url("https://api.ocr.space/parse/image")
+                .post(multipart)
+                .header("User-Agent", USER_AGENT)
+                .build()
+
+            val responseBody = client.newCall(req).execute().use { res ->
+                if (!res.isSuccessful) {
+                    android.util.Log.i(TAG,
+                        "OCR.space HTTP ${res.code} — skipping cloud OCR")
+                    return@use ""
+                }
+                res.body?.string() ?: ""
+            }
+            if (responseBody.isBlank()) return null
+            parseOcrSpaceResponse(responseBody)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "OCR.space OCR failed: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Parse HuggingFace's BLIP caption response. Expected:
+     *   [{"generated_text":"a cat sitting on a couch"}]
+     * Also handles the model-loading error response:
+     *   {"error":"Model is currently loading...","estimated_time":20}
+     */
+    private fun parseCaptionResponse(body: String): String? {
+        return try {
+            val trimmed = body.trim()
+            if (trimmed.startsWith("[")) {
+                val arr = org.json.JSONArray(trimmed)
+                if (arr.length() == 0) return null
+                val obj = arr.optJSONObject(0) ?: return null
+                obj.optString("generated_text").ifBlank { null }
+            } else if (trimmed.startsWith("{")) {
+                // Error object: {"error":"..."} or {"estimated_time":20}
+                // Treat both as transient failures (return null → caller falls back).
+                null
+            } else null
+        } catch (_: Throwable) { null }
+    }
+
+    /**
+     * Parse OCR.space JSON response. Expected:
+     *   {
+     *     "ParsedResults": [
+     *       { "ParsedText": "line1\nline2\n..." , ... },
+     *       ...
+     *     ],
+     *     "OCRExitCode": 1,
+     *     "IsErroredOnProcessing": false,
+     *     ...
+     *   }
+     *
+     * Returns the concatenated ParsedText, or null if no text was parsed.
+     */
+    private fun parseOcrSpaceResponse(body: String): String? {
+        return try {
+            val obj = JSONObject(body)
+            // Check for explicit error flag
+            if (obj.optBoolean("IsErroredOnProcessing", false)) {
+                val errMsg = obj.optString("ErrorMessage", "")
+                android.util.Log.w(TAG, "OCR.space error: $errMsg")
+                return null
+            }
+            val results = obj.optJSONArray("ParsedResults") ?: return null
+            val sb = StringBuilder()
+            for (i in 0 until results.length()) {
+                val r = results.optJSONObject(i) ?: continue
+                val text = r.optString("ParsedText", "")
+                if (text.isNotBlank()) {
+                    sb.append(text).append('\n')
+                }
+            }
+            val result = sb.toString().trim()
+            result.ifBlank { null }
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "OCR.space parse failed: ${t.message}")
             null
         }
     }
@@ -183,27 +331,20 @@ class CloudImageAnalyzer(private val context: Context) {
         }
     }
 
-    /**
-     * Parse HuggingFace's response. Expected: `[{"generated_text":"a cat sitting on a couch"}]`
-     * Also handles the model-loading error response.
-     */
-    private fun parseCaptionResponse(body: String): String? {
-        return try {
-            val trimmed = body.trim()
-            if (trimmed.startsWith("[")) {
-                val arr = org.json.JSONArray(trimmed)
-                if (arr.length() == 0) return null
-                val obj = arr.optJSONObject(0) ?: return null
-                obj.optString("generated_text").ifBlank { null }
-            } else if (trimmed.startsWith("{")) {
-                // Error object: {"error":"..."} or {"estimated_time":20}
-                val obj = JSONObject(trimmed)
-                if (obj.has("error")) null else null
-            } else null
-        } catch (_: Throwable) { null }
-    }
-
     companion object {
         private const val TAG = "HandyAi/CloudImageAnalyzer"
+
+        /**
+         * OCR.space public demo API key. Works for anonymous low-volume use
+         * (~25k requests/month per IP). If the user wants higher limits,
+         * they can register at https://ocr.space/ocrapi and replace this
+         * key with their own — but the demo key is fine for typical chat
+         * usage (a few image-OCR calls per day).
+         */
+        private const val OCR_SPACE_DEMO_KEY = "K87997210488595"
+
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 }

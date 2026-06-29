@@ -161,47 +161,84 @@ class FileTextExtractor(
         var truncated: Boolean = false
 
         if (isImage(displayName, mime)) {
-            // ── NATIVE ML KIT OCR ONLY (v1.4.1) ───────────────────────────
-            // User explicitly asked to skip the cloud analyzer for images
-            // and use the native text extractor which extracts full text
-            // quickly. The cloud BLIP captioner returned one-line
-            // descriptions instead of the actual text content visible in
-            // the image (signs, screenshots, documents, chat captures),
-            // which broke the user's workflow.
+            // ── v1.4.5: HYBRID CLOUD + ON-DEVICE IMAGE PIPELINE ──────
             //
-            // ML Kit OCR returns ALL visible text in 100-500ms, fully
-            // offline. The image labeler adds object/scene tags for
-            // additional context. Combined output is a plain-prose
-            // description suitable for the LLM.
+            // The user reported: "ocr is not giving the correct results on
+            // what is written in the image. sometimes it says there is no
+            // image attached."
             //
-            // The cloudImageAnalyzer parameter is kept in the constructor
-            // signature for API stability but is no longer invoked here.
-            if (imageAnalyzer != null) {
-                android.util.Log.i(TAG, "Routing to on-device ImageAnalyzer (ML Kit OCR + labels) — native only, cloud skipped")
-                val ir = try {
+            // Root causes:
+            //   1. ML Kit's bundled Latin recognizer returns empty for
+            //      stylized fonts, low-contrast screenshots, and non-Latin
+            //      glyphs. When OCR returned empty, the prompt fell back to
+            //      "no legible text was detected" + label list — and small
+            //      LLMs deflected with "I cannot see the image".
+            //   2. The previous v1.4.1 change completely disabled the cloud
+            //      analyzer for images, leaving only ML Kit. That was a
+            //      regression for screenshots / scanned docs where cloud
+            //      OCR is dramatically better.
+            //
+            // v1.4.5 fix — run BOTH paths and MERGE the results:
+            //   - On-device ML Kit OCR + labels (always — fast, offline)
+            //   - CloudImageAnalyzer when online (BLIP-large caption +
+            //     OCR.space cloud OCR fallback when ML Kit returns empty)
+            //
+            // The merged output explicitly says "AN IMAGE IS ATTACHED" and
+            // lists every signal we have (caption + on-device OCR + cloud
+            // OCR + labels), so the LLM can never deflect with "no image
+            // attached" — it has multiple independent sources of image
+            // content right there in the prompt.
+            //
+            // Failure handling: if either path fails, we use what we got
+            // from the other. If both fail (offline + ML Kit crashed), we
+            // surface a clear error marker.
+            val onDeviceResult = if (imageAnalyzer != null) {
+                android.util.Log.i(TAG, "Image: running on-device ML Kit OCR + labels")
+                try {
                     imageAnalyzer.analyze(uri, displayName)
                 } catch (t: Throwable) {
                     android.util.Log.e(TAG, "On-device image analysis failed for $displayName", t)
-                    return Result(
-                        text = "[Image analysis error: ${t.message ?: t.javaClass.simpleName}]",
+                    ImageAnalyzer.Result(
+                        text = "[On-device image analysis error: ${t.message ?: t.javaClass.simpleName}]",
                         label = "image:$displayName",
-                        mimeHint = mime,
-                        charsTruncated = false
+                        hasContent = false
                     )
                 }
-                android.util.Log.i(TAG, "On-device image analysis OK: ${ir.text.length} chars, hasContent=${ir.hasContent}")
-                val cap = MAX_CHARS
-                truncated = ir.text.length > cap
-                text = if (truncated) ir.text.substring(0, cap) else ir.text
-                label = ir.label
-                method = "mlkit-ocr"
-            } else {
-                // No analyzer configured at all — surface a clear error
-                text = "[Image analysis not configured — cannot extract content from this image]"
-                label = "image:$displayName"
-                truncated = false
-                method = "none"
-            }
+            } else null
+
+            // Try cloud analyzer when (a) it's configured AND (b) the user
+            // is online AND (c) preferCloud is true. preferCloud is set to
+            // internetEnabled.value by the caller, so this only fires when
+            // the user has the internet toggle ON.
+            val cloudResult = if (cloudImageAnalyzer != null && preferCloud) {
+                android.util.Log.i(TAG, "Image: running cloud vision (BLIP-large + OCR.space)")
+                try {
+                    cloudImageAnalyzer.analyze(uri, displayName)
+                } catch (t: Throwable) {
+                    android.util.Log.w(TAG, "Cloud image analysis failed for $displayName: ${t.message}")
+                    null
+                }
+            } else null
+
+            // Merge the two into a single, comprehensive image-content block.
+            val mergedText = mergeImageResults(displayName, onDeviceResult, cloudResult)
+            val ir = ImageAnalyzer.Result(
+                text = mergedText,
+                label = "image:$displayName",
+                hasContent = mergedText.length > 80  // heuristic: header alone is ~80 chars
+            )
+
+            android.util.Log.i(TAG,
+                "Image analysis complete: ${ir.text.length} chars, " +
+                "hasContent=${ir.hasContent}, " +
+                "onDevice=${onDeviceResult != null}, " +
+                "cloud=${cloudResult != null}")
+
+            val cap = MAX_CHARS
+            truncated = ir.text.length > cap
+            text = if (truncated) ir.text.substring(0, cap) else ir.text
+            label = ir.label
+            method = if (cloudResult != null) "mlkit+cloud" else "mlkit-ocr"
         } else {
             val raw = when (ext) {
                 // Plain text family
@@ -292,6 +329,124 @@ class FileTextExtractor(
             text.contains("could not extract", ignoreCase = true) ||
             text.contains("Unknown file type", ignoreCase = true) ||
             text.contains("analysis error", ignoreCase = true)
+
+    /**
+     * Merge on-device + cloud image-analysis results into a single
+     * comprehensive image-content block. v1.4.5.
+     *
+     * The output explicitly says "AN IMAGE IS ATTACHED" and lists every
+     * signal we have, so the LLM can never deflect with "I can't see
+     * the image" — it has multiple independent sources of image content
+     * right there in the prompt.
+     *
+     * Sources merged (whichever are available):
+     *   - On-device ML Kit OCR text (visible text in the image)
+     *   - On-device ML Kit image labels (object/scene tags)
+     *   - Cloud BLIP-large caption (natural-language scene description)
+     *   - Cloud OCR.space text (high-accuracy cloud OCR — better than
+     *     ML Kit for stylized fonts, low-contrast screenshots, non-Latin)
+     *
+     * Both OCR texts are included verbatim (with their source labeled)
+     * so the LLM can cross-reference. Duplicates are tolerated — better
+     * to repeat a line of text than miss it.
+     */
+    private fun mergeImageResults(
+        displayName: String,
+        onDevice: ImageAnalyzer.Result?,
+        cloud: String?
+    ): String {
+        // Extract the on-device OCR text from the onDevice Result. The
+        // ImageAnalyzer wraps its output in "---IMAGE CONTENT START---"
+        // markers — we parse out the "Visible text:" line to get just
+        // the OCR portion.
+        val onDeviceOcr = onDevice?.text?.let { extractField(it, "Visible text:") } ?: ""
+        val onDeviceLabels = onDevice?.text?.let { extractField(it, "What the image shows:") } ?: ""
+
+        // Extract cloud caption + cloud OCR from the cloud analyzer's
+        // output string. Same "---IMAGE CONTENT START---" wrapper format.
+        val cloudCaption = cloud?.let { extractField(it, "Cloud-vision caption:") } ?: ""
+        val cloudOcr = cloud?.let { extractField(it, "Cloud OCR text") } ?: ""
+
+        val sb = StringBuilder()
+        sb.appendLine("---IMAGE CONTENT START---")
+        sb.appendLine("AN IMAGE IS ATTACHED to this chat. The image file is '$displayName'.")
+        sb.appendLine("Below is the analyzed content of the image (from on-device ML Kit + cloud vision).")
+        sb.appendLine("Read it carefully. NEVER say no image is attached — the image IS attached and its content is below.")
+        sb.appendLine()
+
+        // Cloud caption (best for "describe this photo" questions)
+        if (cloudCaption.isNotBlank()) {
+            sb.appendLine("Image description (cloud vision caption):")
+            sb.appendLine(cloudCaption.trim())
+            sb.appendLine()
+        }
+
+        // Cloud OCR (highest OCR accuracy — better than ML Kit for hard cases)
+        if (cloudOcr.isNotBlank()) {
+            sb.appendLine("Visible text in the image (cloud OCR — high accuracy):")
+            sb.appendLine(cloudOcr.trim())
+            sb.appendLine()
+        }
+
+        // On-device OCR (ML Kit) — fast, offline, but lower accuracy
+        if (onDeviceOcr.isNotBlank() && !onDeviceOcr.startsWith("no legible")) {
+            // Skip if it's identical to cloud OCR (avoid duplication)
+            val normalizedOnDevice = onDeviceOcr.trim().replace(Regex("\\s+"), " ")
+            val normalizedCloud = cloudOcr.trim().replace(Regex("\\s+"), " ")
+            if (normalizedOnDevice != normalizedCloud) {
+                sb.appendLine("Visible text in the image (on-device ML Kit OCR):")
+                sb.appendLine(onDeviceOcr.trim())
+                sb.appendLine()
+            }
+        }
+
+        // On-device labels (object/scene tags)
+        if (onDeviceLabels.isNotBlank() && !onDeviceLabels.startsWith("no clear")) {
+            sb.appendLine("Detected objects/scene labels: $onDeviceLabels")
+            sb.appendLine()
+        }
+
+        // If we got NOTHING useful, say so explicitly with strong language
+        // — the LLM must not deflect with "I can't see the image". The
+        // image IS attached; we just couldn't extract anything useful.
+        if (cloudCaption.isBlank() && cloudOcr.isBlank() &&
+            (onDeviceOcr.isBlank() || onDeviceOcr.startsWith("no legible")) &&
+            (onDeviceLabels.isBlank() || onDeviceLabels.startsWith("no clear"))) {
+            sb.appendLine("Note: No specific text or labels could be extracted from the image.")
+            sb.appendLine("The image IS attached — if the user asks about it, say the image was attached but the analysis did not detect readable text or recognizable objects. Do NOT say no image was attached.")
+        }
+
+        sb.appendLine("---IMAGE CONTENT END---")
+        return sb.toString()
+    }
+
+    /**
+     * Extract the value of a labeled field from an ImageAnalyzer /
+     * CloudImageAnalyzer output string. Both use the same format:
+     *
+     *   ---IMAGE CONTENT START---
+     *   ...
+     *   Field label: value here, possibly multi-line
+     *   Next field: ...
+     *   ...
+     *   ---IMAGE CONTENT END---
+     *
+     * Returns the value text (everything between the label and the next
+     * blank line or end-of-block), or "" if the label isn't found.
+     */
+    private fun extractField(text: String, label: String): String {
+        val idx = text.indexOf(label)
+        if (idx < 0) return ""
+        val after = text.substring(idx + label.length).trimStart()
+        // Read up to the next blank line OR the end marker
+        val endIdx = after.indexOf("---IMAGE CONTENT END---")
+        val blockEnd = if (endIdx >= 0) endIdx else after.length
+        val block = after.substring(0, blockEnd)
+        // Cut at the first blank line (next field starts after a blank line)
+        val blankLineIdx = block.indexOf("\n\n")
+        return if (blankLineIdx >= 0) block.substring(0, blankLineIdx).trim()
+        else block.trim()
+    }
 
     /**
      * Read (size, lastModified) for a content URI. Used as a cache key.

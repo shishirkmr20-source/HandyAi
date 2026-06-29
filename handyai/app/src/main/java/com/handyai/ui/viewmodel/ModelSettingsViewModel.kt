@@ -37,7 +37,6 @@ import kotlinx.coroutines.launch
 class ModelSettingsViewModel(
     private val settings: SettingsRepository,
     private val llm: LlmEngine,
-    private val liteRtlm: com.handyai.llm.LiteRtlmEngine,
     private val imageGen: ImageGenEngine,
     val downloader: ModelDownloader
 ) : ViewModel() {
@@ -73,42 +72,13 @@ class ModelSettingsViewModel(
     fun activate(spec: ModelSpec) = viewModelScope.launch {
         val path = downloader.localPath(spec).absolutePath
         // ── DISPATCH BY MODEL TYPE ────────────────────────────────────
-        // VISION_LITERTLM models (.litertlm files) go through LiteRtlmEngine;
-        // everything else (.task files) goes through MediaPipe LlmEngine.
+        // v1.4.5: VISION_LITERTLM removed. Only LLM (.task) and IMAGE_GEN
+        // (cloud) remain. Vision is now a cloud-only pipeline that runs
+        // automatically whenever a user attaches an image to any text-model
+        // chat — see CloudImageAnalyzer.kt + FileTextExtractor.kt.
         try {
             when (spec.modelType) {
-                ModelType.VISION_LITERTLM -> {
-                    // ── v1.4.3: VISION MODELS TEMPORARILY DISABLED ───────────────
-                    // The LiteRT-LM alpha05 native runtime crashes with a
-                    // SIGSEGV inside `eng.initialize()` on arm64-v8a devices.
-                    // This is a NATIVE crash — it kills the process before
-                    // Java exception handling can run, so the v1.4.2 try-catch
-                    // defenses are useless against it.
-                    //
-                    // Rather than ship a crash, we surface a friendly error
-                    // and tell the user how to get image understanding today:
-                    // attach an image to a text-model chat — ML Kit OCR +
-                    // image labels feed the text model the image's content.
-                    //
-                    // This guard can be removed once LiteRT-LM ships a
-                    // version where `eng.initialize()` is stable on arm64.
-                    val msg = "Vision models (FastVLM) are temporarily disabled in this build — " +
-                        "the on-device runtime crashes natively on 64-bit devices. " +
-                        "To analyze an image, pick a text model (Qwen / Phi / SmolLM) and " +
-                        "attach the image — on-device ML Kit OCR + image labels give the " +
-                        "model the image's content automatically."
-                    llm.surfaceError(msg)
-                    android.util.Log.w("HandyAi/ModelSettingsVM",
-                        "Vision model activation blocked: LiteRT-LM alpha05 eng.initialize() " +
-                        "crashes natively on arm64-v8a. See worklog investigate-vlm-crash.")
-                    return@launch
-                }
                 ModelType.LLM -> {
-                    // Unload the LiteRT-LM engine if a .litertlm model was
-                    // previously active.
-                    if (liteRtlm.isModelLoaded()) {
-                        liteRtlm.unload()
-                    }
                     val result = try {
                         llm.setActiveModel(path, spec.id, spec.paramCountB)
                     } catch (t: Throwable) {
@@ -127,10 +97,8 @@ class ModelSettingsViewModel(
             }
         } catch (t: Throwable) {
             // ── v1.4.2: top-level safety net ────────────────────────────
-            // If anything escapes the per-engine try-catches above (e.g. a
-            // NoClassDefFoundError if LiteRT-LM's classes aren't on the
-            // classpath on an older device), surface a friendly error
-            // instead of letting the ViewModel crash.
+            // If anything escapes the per-engine try-catches above, surface
+            // a friendly error instead of letting the ViewModel crash.
             android.util.Log.e("HandyAi/ModelSettingsVM",
                 "Model activation top-level failure", t)
             llm.surfaceError(t.message ?: t.javaClass.simpleName
@@ -140,19 +108,15 @@ class ModelSettingsViewModel(
 
     fun unload() = viewModelScope.launch {
         llm.unload()
-        liteRtlm.unload()
         imageGen.unload()
         settings.setActiveModel(null, null)
     }
 
     /** Delete the downloaded model file so it can be re-downloaded fresh. */
     fun delete(spec: ModelSpec) = viewModelScope.launch {
-        val activeName = llm.activeModelName() ?: liteRtlm.activeModelName()
+        val activeName = llm.activeModelName()
         if (activeName == spec.displayName) {
-            when (spec.modelType) {
-                ModelType.VISION_LITERTLM -> liteRtlm.unload()
-                else -> llm.unload()
-            }
+            llm.unload()
             settings.setActiveModel(null, null)
         }
         downloader.localPath(spec).delete()
@@ -189,7 +153,6 @@ class ModelSettingsViewModelFactory(
         ModelSettingsViewModel(
             settings = settings,
             llm = llm,
-            liteRtlm = app.liteRtlmEngine,
             imageGen = app.imageGenEngine,
             downloader = app.modelDownloader
         ) as T

@@ -46,8 +46,12 @@ import java.io.File
  *   - If loading throws, the LlmEngine surfaces the error via its
  *     StateFlow, which the UI already displays
  *
- * Note: Image generation is now cloud-based (Pollinations.ai) and
- * doesn't require model loading, so this only handles LLM models.
+ * v1.4.5: Removed the LiteRT-LM dispatch branch. All downloadable models
+ * are now MediaPipe `.task` files (FastVLM `.litertlm` removed due to
+ * native crashes — see ModelCatalog.kt).
+ *
+ * Note: Image generation is cloud-based (Pollinations.ai) and doesn't
+ * require model loading, so this only handles LLM models.
  */
 object ModelAutoLoader {
 
@@ -57,16 +61,16 @@ object ModelAutoLoader {
     /**
      * Should be called once from HandyAiApp.onCreate(). Reads the saved
      * model path from DataStore and, if non-null and the file still
-     * exists, asks the appropriate engine to load it.
+     * exists, asks the MediaPipe LlmEngine to load it.
      *
-     * Dispatch by file extension:
-     *   - `.task`       → MediaPipe LlmEngine (text-only models)
-     *   - `.litertlm`   → LiteRT-LM LiteRtlmEngine (vision models)
+     * v1.4.5: Only handles `.task` files. If the saved path ends in
+     * `.litertlm` (leftover from a previous FastVLM activation before
+     * the upgrade), silently clear the saved path — the runtime that
+     * could load those files has been removed.
      */
     fun autoLoad(
         context: Context,
         llm: LlmEngine,
-        liteRtlm: com.handyai.llm.LiteRtlmEngine,
         settings: SettingsRepository
     ) {
         scope.launch {
@@ -82,37 +86,27 @@ object ModelAutoLoader {
                     settings.setActiveModel(null, null)
                     return@launch
                 }
+                // v1.4.5: leftover .litertlm path from a pre-upgrade FastVLM
+                // activation — clear it so the user picks a fresh text model.
+                if (savedPath.endsWith(".litertlm", ignoreCase = true)) {
+                    Log.w(TAG, "Saved model is .litertlm (vision) — LiteRT-LM runtime removed in v1.4.5. Clearing saved path.")
+                    settings.setActiveModel(null, null)
+                    return@launch
+                }
                 // Look up the param count from the catalog (matched by
                 // displayName) so the small-model inline-content strategy
                 // works after restart.
                 val savedName = settings.activeModelName.first()
                 val spec = ModelCatalog.ALL.firstOrNull { it.displayName == savedName }
 
-                // ── DISPATCH BY EXTENSION ──────────────────────────────────
-                // .task → MediaPipe; .litertlm → LiteRT-LM. The two runtimes
-                // can't load each other's files.
-                val isLitertlm = savedPath.endsWith(".litertlm", ignoreCase = true)
-                if (isLitertlm) {
-                    // ── v1.4.3: skip auto-loading .litertlm models ─────────
-                    // LiteRT-LM alpha05 crashes natively in eng.initialize()
-                    // on arm64-v8a. If we auto-load here, the app crashes on
-                    // every launch until the user manually clears the saved
-                    // model path. Instead, silently clear the saved path and
-                    // let the user pick a text model from the Models screen.
-                    Log.w(TAG, "Saved model is .litertlm (vision) — skipping auto-load " +
-                        "(LiteRT-LM alpha05 native crash). Clearing saved path.")
-                    settings.setActiveModel(null, null)
+                if (llm.isModelLoaded()) {
+                    Log.i(TAG, "MediaPipe model already loaded — skipping.")
                     return@launch
-                } else {
-                    if (llm.isModelLoaded()) {
-                        Log.i(TAG, "MediaPipe model already loaded — skipping.")
-                        return@launch
-                    }
-                    Log.i(TAG, "Auto-loading MediaPipe model: $savedPath (${file.length()} bytes)")
-                    val result = llm.setActiveModel(savedPath, spec?.id, spec?.paramCountB)
-                    result.onSuccess { Log.i(TAG, "MediaPipe auto-load succeeded.") }
-                        .onFailure { err -> Log.e(TAG, "MediaPipe auto-load failed.", err) }
                 }
+                Log.i(TAG, "Auto-loading MediaPipe model: $savedPath (${file.length()} bytes)")
+                val result = llm.setActiveModel(savedPath, spec?.id, spec?.paramCountB)
+                result.onSuccess { Log.i(TAG, "MediaPipe auto-load succeeded.") }
+                    .onFailure { err -> Log.e(TAG, "MediaPipe auto-load failed.", err) }
             } catch (t: Throwable) {
                 Log.e(TAG, "Auto-load unexpected error.", t)
             }

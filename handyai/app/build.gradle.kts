@@ -13,8 +13,8 @@ android {
         applicationId = "com.handyai"
         minSdk = 26
         targetSdk = 35
-        versionCode = 37
-        versionName = "1.4.4"
+        versionCode = 38
+        versionName = "1.4.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -100,8 +100,12 @@ dependencies {
     // MediaPipe LLM Inference API — 0.10.22+ required for litert-community
     // multi-prefill-seq (ekv1280) model format. 0.10.21 throws:
     //   "RET_CHECK failure (prefill_input_names.size() % 2)==(0)"
-    // when loading _multi-prefill-seq_ models (Qwen2.5, SmolLM, Phi-4).
+    // when loading _multi-prefill-seq_ models (Qwen2.5, Phi-4).
     // 0.10.35 is the latest stable as of 2026-06.
+    //
+    // v1.4.5: SmolLM catalog entry removed (see ModelCatalog.kt), so this
+    // dep now only loads Qwen and Phi models. Kept because MediaPipe is the
+    // primary on-device LLM runtime.
     //
     // NOTE: `tasks-vision` was previously added here for the Image Generator
     // API (Stable Diffusion 1.5). That class is NOT shipped in the public
@@ -111,15 +115,15 @@ dependencies {
     // now a stub. See ImageGenEngine.kt for the restoration plan.
     implementation("com.google.mediapipe:tasks-genai:0.10.35")
 
-    // LiteRT-LM — Google's on-device LLM runtime that supports BOTH text-only
-    // .task models AND multimodal .litertlm vision-language models (like
-    // Apple FastVLM-0.5B). Used by [LiteRtlmEngine] for the FastVLM catalog
-    // entry — MediaPipe's LlmInference API can't run .litertlm files.
+    // v1.4.5: LiteRT-LM dependency REMOVED.
+    // The alpha05 native runtime crashed with SIGSEGV in eng.initialize()
+    // on arm64-v8a devices whenever a .litertlm vision model (FastVLM-0.5B)
+    // was activated. Vision is now a cloud-only pipeline (HuggingFace BLIP-
+    // large + OCR.space + ML Kit OCR) — see CloudImageAnalyzer.kt and
+    // ImageAnalyzer.kt. No native crash surface, smaller APK, simpler code.
     //
-    // Alpha quality (0.0.0-alpha05) but self-contained AAR (no transitive
-    // deps) — confirmed at POM fetch time. If a future version breaks the
-    // build, pin to alpha05 and revisit.
-    implementation("com.google.ai.edge.litertlm:litertlm:0.0.0-alpha05")
+    // Previous dep line, kept as a comment for posterity:
+    //   implementation("com.google.ai.edge.litertlm:litertlm:0.0.0-alpha05")
 
     // File parsing
     implementation("com.tom-roush:pdfbox-android:2.0.27.0") // PDF (correct groupId has hyphen, not underscore)

@@ -74,70 +74,169 @@ class WebSearchService {
         .retryOnConnectionFailure(true)
         .build()
 
-    suspend fun search(query: String, maxResults: Int = 3): String = withContext(Dispatchers.IO) {
+    suspend fun search(query: String, maxResults: Int = 4): String = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext ""
 
-        val sb = StringBuilder()
-        sb.appendLine("Web search results for: \"$query\"")
-        sb.appendLine("Fetched at: ${java.util.Date()}")
-        sb.appendLine()
+        // v1.4.5: collect results from every source, then RANK them by
+        // query-term overlap so the most relevant snippets surface first.
+        // Previously the sources were concatenated in source-order (Wiki →
+        // DDG → Bing), which meant a less-relevant Bing snippet could
+        // push down a more-relevant DDG one. Now each source produces a
+        // list of (title, snippet) pairs, all are merged, scored, and the
+        // top N are returned in ranked order.
+        val allResults = mutableListOf<SearchHit>()
+        val sourcesUsed = mutableListOf<String>()
 
-        // Source 1: Wikipedia
+        // Source 1: Wikipedia summary (still the best for definitional queries)
         val wikiResult = tryWikipedia(query)
         if (wikiResult.isNotBlank()) {
-            sb.appendLine("--- Source: Wikipedia ---")
-            sb.appendLine(wikiResult)
-            sb.appendLine()
+            sourcesUsed += "Wikipedia"
+            allResults += SearchHit(
+                title = "Wikipedia: $query",
+                snippet = wikiResult,
+                source = "Wikipedia",
+                // Wikipedia is highly trusted — small bonus
+                sourceBoost = 5
+            )
         }
 
         // Source 2: DuckDuckGo Instant Answer API
         val ddgResult = tryDuckDuckGoInstantAnswer(query)
         if (ddgResult.isNotBlank()) {
-            sb.appendLine("--- Source: DuckDuckGo ---")
-            sb.appendLine(ddgResult)
+            sourcesUsed += "DuckDuckGo"
+            allResults += SearchHit(
+                title = "DuckDuckGo: $query",
+                snippet = ddgResult,
+                source = "DuckDuckGo",
+                sourceBoost = 4
+            )
+        }
+
+        // Source 3: DuckDuckGo HTML scrape (only if no instant answer)
+        if (ddgResult.isBlank()) {
+            val ddgHtmlHits = tryDuckDuckGoHtml(query, maxResults)
+            if (ddgHtmlHits.isNotEmpty()) {
+                sourcesUsed += "DuckDuckGo (web)"
+                allResults += ddgHtmlHits
+            }
+        }
+
+        // Source 4: mwmbl.org (free, no API key, returns JSON with title +
+        // extract). Small independent index, but no auth/rate-limit issues.
+        val mwmblHits = tryMwmbl(query, maxResults)
+        if (mwmblHits.isNotEmpty()) {
+            sourcesUsed += "mwmbl"
+            allResults += mwmblHits
+        }
+
+        // Source 5: Bing HTML scrape — last resort (heaviest, rate-limited)
+        if (allResults.size < 2) {
+            val bingHits = tryBingHtml(query, maxResults)
+            if (bingHits.isNotEmpty()) {
+                sourcesUsed += "Bing"
+                allResults += bingHits
+            }
+        }
+
+        // Source 6: Wikipedia search API (suggest) — when the strict summary
+        // returned nothing useful. Adds alternative-title hits.
+        if (wikiResult.isBlank()) {
+            val wikiSearchHits = tryWikipediaSearch(query)
+            if (wikiSearchHits.isNotEmpty()) {
+                sourcesUsed += "Wikipedia (search)"
+                allResults += wikiSearchHits
+            }
+        }
+
+        if (allResults.isEmpty()) {
+            return@withContext "[No web results found for: \"$query\". Try rephrasing or check your internet connection.]"
+        }
+
+        // ── RANK by query-term overlap + source boost ─────────────────
+        // Score = (number of query terms that appear in title+snippet)
+        //         + sourceBoost (Wikipedia/DDG get a small bonus)
+        // Top-N wins; ties broken by snippet length (longer = more info).
+        val queryTerms = query.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.length >= 3 }
+            .toSet()
+
+        val ranked = allResults.map { hit ->
+            val text = (hit.title + " " + hit.snippet).lowercase()
+            val overlap = queryTerms.count { it in text }
+            hit to (overlap + hit.sourceBoost)
+        }.sortedWith(
+            compareByDescending<Pair<SearchHit, Int>> { it.second }
+                .thenByDescending { it.first.snippet.length }
+        ).take(maxResults).map { it.first }
+
+        // ── ASSEMBLE the final result string ──────────────────────────
+        val sb = StringBuilder()
+        sb.appendLine("Web search results for: \"$query\"")
+        sb.appendLine("Fetched at: ${java.util.Date()}")
+        sb.appendLine("Sources: ${sourcesUsed.distinct().joinToString(", ")}")
+        sb.appendLine()
+        ranked.forEachIndexed { i, hit ->
+            sb.appendLine("${i + 1}. [${hit.source}] ${hit.title}")
+            if (hit.snippet.isNotBlank()) {
+                sb.appendLine("   ${hit.snippet.replace("\n", "\n   ")}")
+            }
             sb.appendLine()
         }
 
-        // Source 3: DuckDuckGo HTML (only if no instant answer)
-        if (ddgResult.isBlank()) {
-            val ddgHtml = tryDuckDuckGoHtml(query, maxResults)
-            if (ddgHtml.isNotBlank()) {
-                sb.appendLine("--- Source: DuckDuckGo (web results) ---")
-                sb.appendLine(ddgHtml)
-                sb.appendLine()
-            }
-        }
-
-        // Source 4: Bing HTML scrape — useful when DDG blocks the
-        // mobile UA or returns no results for the query
-        if (wikiResult.isBlank() && ddgResult.isBlank()) {
-            val bingResult = tryBingHtml(query, maxResults)
-            if (bingResult.isNotBlank()) {
-                sb.appendLine("--- Source: Bing ---")
-                sb.appendLine(bingResult)
-                sb.appendLine()
-            }
-        }
-
-        // Source 5: Wikipedia OpenSearch — suggest alternative phrasings
-        // when the strict summary returned nothing useful. This helps for
-        // queries like "einstein relativity" where the exact title doesn't
-        // match but a search would.
-        if (wikiResult.isBlank()) {
-            val wikiSuggest = tryWikipediaSearch(query)
-            if (wikiSuggest.isNotBlank()) {
-                sb.appendLine("--- Source: Wikipedia (search) ---")
-                sb.appendLine(wikiSuggest)
-                sb.appendLine()
-            }
-        }
-
         val result = sb.toString().trim()
-        if (result.isBlank() || result.length < 80) {
+        if (result.length < 80) {
             "[No web results found for: \"$query\". Try rephrasing or check your internet connection.]"
         } else {
             result
         }
+    }
+
+    /**
+     * A single search-result hit. Used by the ranker.
+     */
+    private data class SearchHit(
+        val title: String,
+        val snippet: String,
+        val source: String,
+        /** Trust/source bonus added to the relevance score. */
+        val sourceBoost: Int = 0
+    )
+
+    /**
+     * mwmbl.org search — free, no API key, returns JSON with title + extract.
+     * Endpoint: https://api.mwmbl.org/search?q=<query>
+     * Response shape: { "results": [ { "title": "...", "extract": "...", "url": "..." } ] }
+     *
+     * Small independent search index. Useful as a no-auth, no-rate-limit
+     * alternative to DDG/Bing scraping. Coverage is narrower than the big
+     * engines, so we use it as a supplementary source rather than primary.
+     */
+    private fun tryMwmbl(query: String, maxResults: Int): List<SearchHit> {
+        return try {
+            val url = "https://api.mwmbl.org/search?q=" + URLEncoder.encode(query, "UTF-8")
+            val json = fetchJson(url)
+            if (json.isBlank()) return emptyList()
+
+            // Response shape: {"results":[{"title":"...","extract":"...","url":"..."}]}
+            // Use the same naive JSON-field extractor (no need for a full
+            // parser dependency for this).
+            val titles = extractAllJsonFields(json, "title")
+            val extracts = extractAllJsonFields(json, "extract")
+            if (titles.isEmpty()) return emptyList()
+
+            titles.indices.take(maxResults).mapNotNull { i ->
+                val title = titles.getOrNull(i)?.ifBlank { null } ?: return@mapNotNull null
+                val extract = extracts.getOrNull(i)?.ifBlank { null } ?: ""
+                SearchHit(
+                    title = title,
+                    snippet = extract,
+                    source = "mwmbl",
+                    sourceBoost = 2
+                )
+            }
+        } catch (_: Throwable) { emptyList() }
     }
 
     /**
@@ -169,29 +268,33 @@ class WebSearchService {
      * Wikipedia search API — returns the top 3 matching page titles with
      * their snippets. Used as a fallback when the summary endpoint returns
      * nothing (e.g. multi-word queries that don't match an exact title).
+     *
+     * v1.4.5: returns List<SearchHit> so the ranker can score these
+     * alongside hits from other sources.
      */
-    private fun tryWikipediaSearch(query: String): String {
+    private fun tryWikipediaSearch(query: String): List<SearchHit> {
         return try {
             val searchUrl = "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" +
                 URLEncoder.encode(query, "UTF-8") + "&format=json&srlimit=3"
             val json = fetchJson(searchUrl)
-            if (json.isBlank()) return ""
+            if (json.isBlank()) return emptyList()
 
             // Extract all "title":"..." and "snippet":"..." pairs
             val titles = extractAllJsonFields(json, "title")
             val snippets = extractAllJsonFields(json, "snippet")
 
-            if (titles.isEmpty()) return ""
-            val sb = StringBuilder()
-            titles.take(3).forEachIndexed { i, title ->
+            if (titles.isEmpty()) return emptyList()
+            titles.indices.take(3).mapNotNull { i ->
+                val title = titles.getOrNull(i)?.ifBlank { null } ?: return@mapNotNull null
                 val snippet = snippets.getOrNull(i)?.let { Jsoup.parse(it).text() } ?: ""
-                sb.appendLine("${i + 1}. $title")
-                if (snippet.isNotBlank()) {
-                    sb.appendLine("   $snippet")
-                }
+                SearchHit(
+                    title = "Wikipedia: $title",
+                    snippet = snippet,
+                    source = "Wikipedia",
+                    sourceBoost = 5
+                )
             }
-            sb.toString().trim()
-        } catch (_: Throwable) { "" }
+        } catch (_: Throwable) { emptyList() }
     }
 
     /**
@@ -236,8 +339,10 @@ class WebSearchService {
     /**
      * DuckDuckGo HTML endpoint — POST form (GET was being throttled).
      * Fetches the top [maxResults] result pages and extracts main text.
+     *
+     * v1.4.5: returns List<SearchHit> so the ranker can score these.
      */
-    private fun tryDuckDuckGoHtml(query: String, maxResults: Int): String {
+    private fun tryDuckDuckGoHtml(query: String, maxResults: Int): List<SearchHit> {
         return try {
             // POST form is the more reliable path — DDG throttles GET requests heavily
             val formBuilder = FormBody.Builder()
@@ -255,24 +360,24 @@ class WebSearchService {
             val html = try {
                 client.newCall(req).execute().use { res -> res.body?.string() ?: "" }
             } catch (_: Throwable) { "" }
-            if (html.isBlank()) return ""
+            if (html.isBlank()) return emptyList()
             val doc = Jsoup.parse(html)
             // Result links
             val results = doc.select(".result, .web-result").take(maxResults)
-            if (results.isEmpty()) return ""
-            val sb = StringBuilder()
-            results.forEachIndexed { i, resultEl ->
+            if (results.isEmpty()) return emptyList()
+            results.mapNotNull { resultEl ->
                 val titleEl = resultEl.selectFirst(".result__title, .result__a, h2") ?: resultEl.selectFirst("a")
                 val snippetEl = resultEl.selectFirst(".result__snippet")
-                val title = titleEl?.text()?.trim() ?: "(no title)"
+                val title = titleEl?.text()?.trim()?.ifBlank { null } ?: return@mapNotNull null
                 val snippet = snippetEl?.text()?.trim() ?: ""
-                if (title.isNotBlank() || snippet.isNotBlank()) {
-                    sb.appendLine("${i + 1}. $title")
-                    if (snippet.isNotBlank()) sb.appendLine("   $snippet")
-                }
-            }
-            sb.toString().trim().ifBlank { "" }
-        } catch (_: Throwable) { "" }
+                SearchHit(
+                    title = title,
+                    snippet = snippet,
+                    source = "DuckDuckGo",
+                    sourceBoost = 3
+                )
+            }.filter { it.title.isNotBlank() || it.snippet.isNotBlank() }
+        } catch (_: Throwable) { emptyList() }
     }
 
     /**
@@ -280,40 +385,47 @@ class WebSearchService {
      * in the result HTML, including the "answer box" at the top of the
      * page. We extract both the answer box (if present) and the top
      * organic result snippets.
+     *
+     * v1.4.5: returns List<SearchHit> so the ranker can score these.
      */
-    private fun tryBingHtml(query: String, maxResults: Int): String {
+    private fun tryBingHtml(query: String, maxResults: Int): List<SearchHit> {
         return try {
             val url = "https://www.bing.com/search?q=" + URLEncoder.encode(query, "UTF-8") +
                 "&setlang=en-US&cc=US"
             val html = fetchHtml(url)
-            if (html.isBlank()) return ""
+            if (html.isBlank()) return emptyList()
             val doc = Jsoup.parse(html)
-
-            val sb = StringBuilder()
+            val hits = mutableListOf<SearchHit>()
 
             // Bing answer box (often has the actual answer the user wants)
             val answerBox = doc.selectFirst(".b_factrow, .b_caption, .b_subtitle, .b_ans .b_focusTextLarge, .b_algoAnswer")
             answerBox?.text()?.let { ans ->
                 if (ans.length > 40) {
-                    sb.appendLine("Answer: $ans")
-                    sb.appendLine()
+                    hits += SearchHit(
+                        title = "Bing answer box",
+                        snippet = ans,
+                        source = "Bing",
+                        sourceBoost = 4
+                    )
                 }
             }
 
             // Top organic results — Bing uses <li class="b_algo">
             val results = doc.select("li.b_algo").take(maxResults)
-            results.forEachIndexed { i, resultEl ->
+            results.forEach { resultEl ->
                 val titleEl = resultEl.selectFirst("h2 a")
                 val snippetEl = resultEl.selectFirst(".b_caption p, .b_caption")
-                val title = titleEl?.text()?.trim() ?: "(no title)"
+                val title = titleEl?.text()?.trim()?.ifBlank { null } ?: return@forEach
                 val snippet = snippetEl?.text()?.trim() ?: ""
-                if (title.isNotBlank()) {
-                    sb.appendLine("${i + 1}. $title")
-                    if (snippet.isNotBlank()) sb.appendLine("   $snippet")
-                }
+                hits += SearchHit(
+                    title = title,
+                    snippet = snippet,
+                    source = "Bing",
+                    sourceBoost = 1
+                )
             }
-            sb.toString().trim().ifBlank { "" }
-        } catch (_: Throwable) { "" }
+            hits
+        } catch (_: Throwable) { emptyList() }
     }
 
     private fun fetchJson(url: String): String {
