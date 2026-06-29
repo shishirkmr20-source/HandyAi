@@ -360,7 +360,15 @@ class FileTextExtractor(
         // markers — we parse out the "Visible text:" line to get just
         // the OCR portion.
         val onDeviceOcr = onDevice?.text?.let { extractField(it, "Visible text:") } ?: ""
-        val onDeviceLabels = onDevice?.text?.let { extractField(it, "What the image shows:") } ?: ""
+        // v1.4.6: "Scene labels:" replaces the old "What the image
+        // shows:" label. We also extract the new "Detected objects"
+        // block from the on-device analyzer.
+        val onDeviceLabels = onDevice?.text?.let {
+            extractField(it, "Scene labels:").ifBlank {
+                extractField(it, "What the image shows:")
+            }
+        } ?: ""
+        val onDeviceObjects = onDevice?.text?.let { extractBlock(it, "Detected objects") } ?: ""
 
         // Extract cloud caption + cloud OCR from the cloud analyzer's
         // output string. Same "---IMAGE CONTENT START---" wrapper format.
@@ -400,9 +408,18 @@ class FileTextExtractor(
             }
         }
 
+        // v1.4.6: On-device object detection — countable objects with
+        // spatial positions. Most useful signal for "what's in this
+        // photo" questions when cloud caption is unavailable.
+        if (onDeviceObjects.isNotBlank()) {
+            sb.appendLine("Objects detected in the image (on-device ML Kit, with positions):")
+            sb.appendLine(onDeviceObjects.trim())
+            sb.appendLine()
+        }
+
         // On-device labels (object/scene tags)
         if (onDeviceLabels.isNotBlank() && !onDeviceLabels.startsWith("no clear")) {
-            sb.appendLine("Detected objects/scene labels: $onDeviceLabels")
+            sb.appendLine("Scene labels: $onDeviceLabels")
             sb.appendLine()
         }
 
@@ -411,13 +428,38 @@ class FileTextExtractor(
         // image IS attached; we just couldn't extract anything useful.
         if (cloudCaption.isBlank() && cloudOcr.isBlank() &&
             (onDeviceOcr.isBlank() || onDeviceOcr.startsWith("no legible")) &&
-            (onDeviceLabels.isBlank() || onDeviceLabels.startsWith("no clear"))) {
+            (onDeviceLabels.isBlank() || onDeviceLabels.startsWith("no clear")) &&
+            onDeviceObjects.isBlank()) {
             sb.appendLine("Note: No specific text or labels could be extracted from the image.")
             sb.appendLine("The image IS attached — if the user asks about it, say the image was attached but the analysis did not detect readable text or recognizable objects. Do NOT say no image was attached.")
         }
 
         sb.appendLine("---IMAGE CONTENT END---")
         return sb.toString()
+    }
+
+    /**
+     * Extract a multi-line block following a header line. Used for the
+     * "Detected objects" block which contains multiple indented bullet
+     * lines rather than a single field value.
+     *
+     * Returns everything from the line AFTER the header up to the next
+     * blank line or "---IMAGE CONTENT END---", with leading whitespace
+     * preserved (so bullet indentation survives).
+     */
+    private fun extractBlock(text: String, header: String): String {
+        val idx = text.indexOf(header)
+        if (idx < 0) return ""
+        // Find end of the header line
+        val lineEnd = text.indexOf('\n', idx)
+        if (lineEnd < 0) return ""
+        val rest = text.substring(lineEnd + 1)
+        // Block ends at the first blank line OR the end marker
+        val endIdx = rest.indexOf("---IMAGE CONTENT END---")
+        val candidate = if (endIdx >= 0) rest.substring(0, endIdx) else rest
+        val blankIdx = candidate.indexOf("\n\n")
+        return if (blankIdx >= 0) candidate.substring(0, blankIdx).trim()
+        else candidate.trim()
     }
 
     /**

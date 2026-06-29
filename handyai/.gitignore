@@ -12,3 +12,23 @@ local.properties
 *.aab
 *.keystore
 .env
+
+# Build artifacts (per-module) — never commit
+app/build/
+**/build/
+**/out/
+
+# KSP / generated sources
+**/generated/ksp/
+**/generated/source/
+**/generated/buildConfig/
+
+# Kotlin compiler scratch files
+*.salive
+*.alive
+
+# IDE / OS junk
+*.swp
+*.log
+.idea/
+*.hprof

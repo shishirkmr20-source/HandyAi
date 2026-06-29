@@ -22,6 +22,8 @@ import android.net.Uri
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+import com.google.mlkit.vision.objects.ObjectDetection
+import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
@@ -121,10 +123,12 @@ class ImageAnalyzer(private val context: Context) {
             hasContent = false
         )
 
-        // Run OCR + labeling in parallel-ish (sequential under IO, but each
-        // is fast — typically 100–500ms per image on a modern phone).
+        // Run OCR + labeling + object detection in parallel-ish (sequential
+        // under IO, but each is fast — typically 100–500ms per image on a
+        // modern phone). v1.4.6 adds object detection for richer scene info.
         val ocrText = runOcr(bitmap)
         val labels = runLabeling(bitmap)
+        val objects = runObjectDetection(bitmap)
 
         val sb = StringBuilder()
         sb.appendLine("---IMAGE CONTENT START---")
@@ -137,7 +141,21 @@ class ImageAnalyzer(private val context: Context) {
             sb.appendLine(ocrText.trim())
         }
         sb.appendLine()
-        sb.append("What the image shows: ")
+        // v1.4.6: Object detection gives the LLM concrete "I see N
+        // objects" info, which is much more useful for describing scenes
+        // than the labeler's top-K tags alone. We list the count of
+        // detected objects + their bounding-box-derived positions (top/
+        // center/bottom, left/center/right) so the LLM can compose a
+        // coherent description ("a person on the left, a cup on the
+        // right, books in the background").
+        if (objects.isNotEmpty()) {
+            sb.appendLine("Detected objects (${objects.size}):")
+            for ((label, position) in objects) {
+                sb.appendLine("  - $label ($position)")
+            }
+            sb.appendLine()
+        }
+        sb.append("Scene labels: ")
         if (labels.isEmpty()) {
             sb.appendLine("no clear objects or scenes were detected by the on-device labeler")
         } else {
@@ -156,7 +174,7 @@ class ImageAnalyzer(private val context: Context) {
         Result(
             text = sb.toString(),
             label = "image:$displayName",
-            hasContent = ocrText.isNotBlank() || labels.isNotEmpty()
+            hasContent = ocrText.isNotBlank() || labels.isNotEmpty() || objects.isNotEmpty()
         )
     }
 
@@ -180,6 +198,62 @@ class ImageAnalyzer(private val context: Context) {
             labeler.process(image)
                 .addOnSuccessListener { labels ->
                     val pairs = labels.map { it.text to it.confidence }
+                    cont.resume(pairs)
+                }
+                .addOnFailureListener { cont.resume(emptyList()) }
+        }
+
+    /**
+     * v1.4.6 — Run ML Kit Object Detection on the bitmap.
+     *
+     * Returns a list of (label, position) pairs where position is a
+     * human-readable location string like "top-left", "center",
+     * "bottom-right" derived from the bounding box. This gives the LLM
+     * concrete, countable objects with spatial context — far more useful
+     * for scene description than the labeler's top-K tags alone.
+     *
+     * Uses the default (non-classification) model which detects generic
+     * objects (people, food, vehicles, etc.) without needing a labeled
+     * classification head. This is the lightest-weight ML Kit detector
+     * and adds only ~2MB to the APK.
+     *
+     * Bounding box → position string:
+     *   - Splits the image into a 3x3 grid (top/center/bottom × left/
+     *     center/right) and labels the cell that contains the box's
+     *     center point.
+     */
+    private suspend fun runObjectDetection(bitmap: android.graphics.Bitmap): List<Pair<String, String>> =
+        suspendCancellableCoroutine { cont ->
+            val options = ObjectDetectorOptions.Builder()
+                .setDetectorMode(ObjectDetectorOptions.SINGLE_IMAGE_MODE)
+                .enableMultipleObjects()
+                .enableClassification()
+                .build()
+            val detector = ObjectDetection.getClient(options)
+            val image = InputImage.fromBitmap(bitmap, 0)
+            detector.process(image)
+                .addOnSuccessListener { detectedObjects ->
+                    val w = bitmap.width.toFloat().coerceAtLeast(1f)
+                    val h = bitmap.height.toFloat().coerceAtLeast(1f)
+                    val pairs = detectedObjects.mapNotNull { obj ->
+                        // Use the highest-confidence classification label
+                        // if available; otherwise label as "object".
+                        val label = obj.labels.maxByOrNull { it.confidence }?.text
+                            ?: "object"
+                        val cx = (obj.boundingBox.left + obj.boundingBox.right) / 2f
+                        val cy = (obj.boundingBox.top + obj.boundingBox.bottom) / 2f
+                        val horiz = when {
+                            cx < w / 3f -> "left"
+                            cx > 2f * w / 3f -> "right"
+                            else -> "center"
+                        }
+                        val vert = when {
+                            cy < h / 3f -> "top"
+                            cy > 2f * h / 3f -> "bottom"
+                            else -> "center"
+                        }
+                        label to "$vert-$horiz"
+                    }
                     cont.resume(pairs)
                 }
                 .addOnFailureListener { cont.resume(emptyList()) }

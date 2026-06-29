@@ -13,8 +13,8 @@ android {
         applicationId = "com.handyai"
         minSdk = 26
         targetSdk = 35
-        versionCode = 38
-        versionName = "1.4.5"
+        versionCode = 39
+        versionName = "1.4.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -134,10 +134,14 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jsoup:jsoup:1.18.3")
 
-    // ML Kit — on-device OCR (text recognition) + image labeling
-    // Bundled model variants (~10MB added to APK) work fully offline.
+    // ML Kit — on-device OCR (text recognition) + image labeling +
+    // object detection. Bundled model variants (~12MB added to APK)
+    // work fully offline. v1.4.6 adds object-detection-default so we
+    // can list discrete objects in the image (more concrete for the
+    // LLM than the generic labeler's top-K tags).
     implementation("com.google.mlkit:text-recognition:16.0.1")
     implementation("com.google.mlkit:image-labeling:17.0.7")
+    implementation("com.google.mlkit:object-detection:17.0.2")
 
     // Icons
     implementation("androidx.compose.material:material-icons-extended")

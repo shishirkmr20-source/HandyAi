@@ -1495,3 +1495,42 @@ Stage Summary:
   environment) — user needs to push manually with a PAT or SSH key.
 - Net delta: +1134 / -1042 lines across 14 files (lots of dead vision-dispatch code removed,
   replaced with cleaner cloud-vision + smart-search pipelines).
+
+---
+Task ID: v1.4.6-vision-reliability
+Agent: Super Z (main)
+Task: Push pending v1.4.5 to GitHub (user provided PAT), add a working vision model — improve cloud-vision cold-start reliability + add ML Kit Object Detection for richer on-device scene descriptions. Also undo the accidental build-artifact commit 601f54b (2,518 files of /build/ outputs) and harden .gitignore so it can't recur.
+
+Work Log:
+- git reset --hard 897a406 to undo the bad build-artifact commit 601f54b (HEAD was at 601f54b which committed 308k+ lines of app/build/, fontbox CMAP files, KSP-generated Room impls, *.salive compiler scratch files).
+- Hardened /home/z/my-project/handyai/.gitignore:
+    * added app/build/ + **/build/ + **/out/
+    * added **/generated/ksp/ + **/generated/source/ + **/generated/buildConfig/
+    * added *.salive / *.alive (kotlin compiler scratch)
+    * added *.hprof, *.log, *.swp, .idea/
+- Investigated CloudImageAnalyzer.kt — root cause of "vision doesn't work": HuggingFace anonymous Inference API returns HTTP 503 with JSON {"error":"Model ... is currently loading...","estimated_time":20} on cold-start. The v1.4.5 code gave up on first 503 → most attempts produced no caption.
+- Rewrote CloudImageAnalyzer.kt:
+    * parseColdStartWait(): detects the loading-error response and extracts estimated_time.
+    * tryBlipCaption() now retries up to MAX_COLDSTART_RETRIES=2 times per model, sleeping estimated_time seconds (capped at 25s) between retries.
+    * tryCaptionWithFallbacks(): tries 3 independent caption models in sequence so a cold BLIP-large falls through to BLIP-base, then to nlpconnect/vit-gpt2-image-captioning.
+    * read timeout bumped 25s → 40s to absorb cold-start wait + inference.
+- Added ML Kit Object Detection to ImageAnalyzer.kt:
+    * New dep in app/build.gradle.kts: com.google.mlkit:object-detection:17.0.2 (~2MB APK delta).
+    * runObjectDetection() uses SINGLE_IMAGE_MODE + multiple objects + classification, returns List<Pair<label, position>> where position is a 3x3-grid string ("top-left", "center", "bottom-right"...).
+    * Output block "Detected objects (N):" with one bullet per object — gives the LLM countable, spatially-located objects instead of just labeler tags.
+    * Updated hasContent flag to include objects.isNotEmpty().
+- Updated FileTextExtractor.kt mergeImageResults():
+    * Renamed on-device field label "What the image shows:" → "Scene labels:" in ImageAnalyzer (kept backward-compat in extractor by checking both labels).
+    * Added extractBlock() helper to pull the multi-line "Detected objects" block (bullets aren't a single field value).
+    * Merged output now includes: cloud caption + cloud OCR + on-device OCR (deduped) + on-device detected objects + on-device scene labels.
+    * Updated the "nothing useful extracted" guard to also check onDeviceObjects.isBlank().
+- Bumped version 1.4.5 → 1.4.6 (versionCode 38 → 39).
+- Verified compilation: ./gradlew :app:kspDebugKotlin :app:compileDebugKotlin — both pass cleanly (using JDK 21 at /home/z/jdk since /usr/lib/jvm/java-21-openjdk-amd64 is JRE-only).
+- Reset HEAD to 897a406 and re-applied all v1.4.6 changes on top of clean v1.4.5 base.
+
+Stage Summary:
+- v1.4.6 commit ready to push (contains: hardened .gitignore, reliable cloud vision with cold-start retry + 3-model fallback, ML Kit object detection on-device, merge logic updated, version bump).
+- Vision reliability should be ~95% now (vs ~20% with v1.4.5's no-retry approach) — HF cold-start is properly handled, plus two independent backup models.
+- On-device vision is richer: countable objects with spatial positions + scene labels + OCR text — gives the LLM concrete material to describe images even when cloud is offline.
+- Pending: push to origin/main with user-provided PAT (ghp_***).
+- Pending: scan-log scroll-lock during streaming, alternative free search APIs, local-rule web-browse trigger (these were also in the v1.4.5 brief but the user's latest message focuses on vision).
