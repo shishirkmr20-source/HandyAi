@@ -574,8 +574,8 @@ class ChatViewModel(
             if (isImage) {
                 sb.appendLine("ATTACHMENT CONTEXT — IMAGE:")
                 sb.appendLine("The user has attached an image. The app has already analyzed it on-device using ML Kit: OCR extracted any visible text, and an image labeler detected the top objects/scenes/concepts. The combined result is included below between the markers.")
-                sb.appendLine("You CAN see this image's content — it has been extracted to text and is sitting in this prompt right now. Do NOT claim you cannot see images, do NOT ask the user to upload again, do NOT say \"I can only see the filename\". The filename alone is NOT all you have — read the OCR text and labels below and use them.")
-                sb.appendLine("If the OCR section says \"(no legible text detected)\", that means the image has no readable text — describe what the labels tell you instead. If the labels section says \"(no high-confidence labels)\", the image was unclear — say so honestly.")
+                sb.appendLine("You CAN see this image's content — it has been extracted to text and is sitting in this prompt right now. Do NOT claim you cannot see images, do NOT ask the user to upload again, do NOT say \"I can only see the filename\". The filename alone is NOT all you have — read the 'Visible text' and 'What the image shows' lines below and use them.")
+                sb.appendLine("Describe what the image actually shows based on the 'What the image shows' line, and quote any text from the 'Visible text' line if relevant. If 'Visible text' says \"no legible text was detected\", the image has no readable text — describe what the labels tell you instead. If 'What the image shows' says \"no clear objects or scenes were detected\", the image was unclear — say so honestly.")
                 sb.appendLine("---IMAGE CONTENT START---")
                 sb.appendLine(fileCtx)
                 sb.appendLine("---IMAGE CONTENT END---")
@@ -672,7 +672,7 @@ class ChatViewModel(
         val truncated = fileContent.length > cap
         val body = if (truncated) fileContent.substring(0, cap) else fileContent
         val truncationNote = if (truncated) "\n[... document continues, ${fileContent.length - cap} more chars not shown ...]" else ""
-        val label = if (isImage) "Image content (OCR + labels from ML Kit)" else "Document content (extracted on-device)"
+        val label = if (isImage) "Image content (analyzed on-device — visible text + detected objects)" else "Document content (extracted on-device)"
         return buildString {
             append(label).append(":").append('\n')
             append(body).append(truncationNote).append('\n')

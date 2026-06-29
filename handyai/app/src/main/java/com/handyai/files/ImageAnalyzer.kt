@@ -44,14 +44,24 @@ import kotlin.coroutines.resume
  * labeler (~5MB) ship inside the APK.
  *
  * The combined output is a single string suitable for feeding to the
- * on-device LLM as part of the chat's system context. The format is:
+ * on-device LLM as part of the chat's system context. The format is
+ * deliberately written as PLAIN PROSE rather than a structured dump:
  *
  *   ---IMAGE CONTENT START---
- *   [OCR text]
- *   (if OCR found nothing: "[no legible text detected]")
+ *   File: photo.jpg
  *
- *   [LABELS] Plant (0.92), Coffee (0.81), Book (0.74)
+ *   Visible text: <OCR text, or "no legible text was detected in this image">
+ *
+ *   What the image shows: plant, coffee, book
  *   ---IMAGE CONTENT END---
+ *
+ * IMPORTANT — why we do NOT include label confidence scores in the output:
+ *   Small on-device models (Qwen 0.5B/1.5B, SmolLM) see decimal numbers
+ *   like "(0.92)" and "(0.81)" next to labels and fixate on them,
+ *   treating the confidence percentages as the topic of conversation
+ *   instead of describing the image. We strip them from the prompt text.
+ *   The confidence threshold (≥0.6) is still applied internally — only
+ *   labels the labeler is reasonably sure about make it into the output.
  *
  * Failure modes are surfaced clearly so the LLM can tell the user
  * what went wrong instead of hallucinating.
@@ -92,20 +102,25 @@ class ImageAnalyzer(private val context: Context) {
 
         val sb = StringBuilder()
         sb.appendLine("---IMAGE CONTENT START---")
-        sb.appendLine("[FILE] $displayName")
+        sb.appendLine("File: $displayName")
         sb.appendLine()
-        sb.appendLine("[OCR TEXT]")
+        sb.append("Visible text: ")
         if (ocrText.isBlank()) {
-            sb.appendLine("(no legible text detected in this image)")
+            sb.appendLine("no legible text was detected in this image")
         } else {
             sb.appendLine(ocrText.trim())
         }
         sb.appendLine()
-        sb.appendLine("[LABELS]")
+        sb.append("What the image shows: ")
         if (labels.isEmpty()) {
-            sb.appendLine("(no high-confidence labels)")
+            sb.appendLine("no clear objects or scenes were detected by the on-device labeler")
         } else {
-            sb.appendLine(labels.joinToString(", ") { "${it.first} (${String.format("%.2f", it.second)})" })
+            // Sort by confidence DESC so the most prominent labels appear
+            // first — gives the LLM a natural priority order to describe.
+            // Confidence scores themselves are intentionally NOT included
+            // (see class kdoc for the reason).
+            val sorted = labels.sortedByDescending { it.second }
+            sb.appendLine(sorted.joinToString(", ") { it.first })
         }
         sb.appendLine("---IMAGE CONTENT END---")
 
