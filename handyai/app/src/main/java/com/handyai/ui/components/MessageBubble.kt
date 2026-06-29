@@ -349,12 +349,29 @@ fun MessageBubble(
                         // else as plain Text. Tables are only parsed for
                         // assistant non-error messages — user input and error
                         // bubbles render verbatim so what-you-typed is what-you-see.
-                        val sanitized = MarkdownParser.sanitize(text)
-                        val canRenderTables = !isUser && !isError && !hasImage
-                        val blocks = if (canRenderTables) {
-                            MarkdownTable.splitBlocks(sanitized)
+                        //
+                        // ── v1.4.4: RICH FORMATTING for assistant messages ────
+                        // For assistant non-error messages, text blocks are
+                        // parsed into AnnotatedString with:
+                        //   - **bold** → bold span
+                        //   - ### heading → bold span
+                        //   - <thought>...</thought> → italic dimmed
+                        //   - <answer>...</answer> → bold
+                        //   - <response>...</response> → unwrapped
+                        // User/error messages render as plain text (verbatim).
+                        val canFormat = !isUser && !isError && !hasImage
+                        val prepared = if (canFormat) {
+                            // Keep tags so parseToAnnotatedString can convert them
+                            MarkdownParser.sanitizeBasic(text)
                         } else {
-                            listOf(MarkdownTable.MessageBlock.Text(sanitized))
+                            // Strip tags for user/error messages (verbatim display)
+                            MarkdownParser.sanitize(text)
+                        }
+                        val canRenderTables = canFormat
+                        val blocks = if (canRenderTables) {
+                            MarkdownTable.splitBlocks(prepared)
+                        } else {
+                            listOf(MarkdownTable.MessageBlock.Text(prepared))
                         }
 
                         // Wrap in a Column so multiple blocks stack vertically.
@@ -365,11 +382,24 @@ fun MessageBubble(
                                 when (block) {
                                     is MarkdownTable.MessageBlock.Text -> {
                                         if (idx > 0) Spacer(Modifier.height(6.dp))
-                                        Text(
-                                            text = block.content,
-                                            style = style,
-                                            color = baseColor
-                                        )
+                                        if (canFormat) {
+                                            // Assistant: AnnotatedString with bold/headings/tags
+                                            val annotated = MarkdownParser.parseToAnnotatedString(
+                                                block.content, isUser = false
+                                            )
+                                            Text(
+                                                text = annotated,
+                                                style = style,
+                                                color = baseColor
+                                            )
+                                        } else {
+                                            // User/error: plain text
+                                            Text(
+                                                text = block.content,
+                                                style = style,
+                                                color = baseColor
+                                            )
+                                        }
                                     }
                                     is MarkdownTable.MessageBlock.Table -> {
                                         if (idx > 0) Spacer(Modifier.height(6.dp))

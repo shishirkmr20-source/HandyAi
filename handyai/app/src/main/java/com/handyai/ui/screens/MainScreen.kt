@@ -1232,29 +1232,23 @@ private fun StreamingBubble(text: String) {
                 .padding(horizontal = 14.dp, vertical = 10.dp)
                 .widthIn(max = 312.dp)
         ) {
-            // ── WHY NO MARKDOWN PARSING HERE ────────────────────────────
-            // Earlier versions called MarkdownParser.parse(text) here to
-            // render **bold** spans. That was the root cause of a hard
-            // crash after the 4th chat in a session: parse() strips the
-            // `**` markers, producing an AnnotatedString SHORTER than the
-            // raw `text`. The Text composable received the parsed (shorter)
-            // string, but `layoutResult` (captured via onTextLayout) lagged
-            // ONE FRAME behind — it still held the layout for the PREVIOUS
-            // (shorter) parsed string. When a new chunk arrived that added
-            // a `**` marker, the parsed string grew, but the stale layout
-            // was for the previous shorter string — calling getCursorRect()
-            // with the new (longer) length on the old (shorter) layout was
-            // an out-of-bounds access → IndexOutOfBoundsException → crash.
+            // ── v1.4.4: RICH FORMATTING in streaming bubble ──────────────
+            // Earlier versions rendered raw sanitized text here. Now we use
+            // parseToAnnotatedString so **bold**, ### headings, and SmolLM
+            // tags render with proper formatting DURING streaming — not just
+            // after the message is persisted.
             //
-            // Now we render the raw (sanitized) text directly. Since no
-            // characters are stripped, `text.length == layout.text.length`
-            // is invariant — the caret can never go out of bounds. The
-            // bold rendering wasn't even visibly working on most devices
-            // anyway (the small on-device LLMs rarely emit well-formed
-            // `**bold**` pairs), so removing it is no visual loss.
-            val sanitized = com.handyai.ui.components.MarkdownParser.sanitize(text)
+            // SAFETY: The caret code below uses `lr.layoutInput.text.length`
+            // (the layout's OWN text length), which is always in-bounds for
+            // that layout. Since Text() receives the AnnotatedString directly,
+            // `lr.layoutInput.text` IS the AnnotatedString, so lengths always
+            // match. The v1.2.9 crash (which used `parsed.length` on a stale
+            // layout) cannot recur with this code.
+            val annotated = com.handyai.ui.components.MarkdownParser.parseToAnnotatedString(
+                text, isUser = false
+            )
             Text(
-                text = sanitized,
+                text = annotated,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
                 onTextLayout = { layoutResult = it }

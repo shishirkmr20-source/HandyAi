@@ -13,8 +13,8 @@ android {
         applicationId = "com.handyai"
         minSdk = 26
         targetSdk = 35
-        versionCode = 36
-        versionName = "1.4.3"
+        versionCode = 37
+        versionName = "1.4.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

@@ -1010,3 +1010,431 @@ Stage Summary:
 - v1.4.3 APK (127 MB) ready at /home/z/my-project/download/handyai-v1.4.3-apk/app-release.apk.
 - GitHub: https://github.com/shishirkmr20-source/HandyAi.git main now at 243da8a.
 - Security: PAT was used inline only; push log cleaned. User should still revoke it since it was shared in chat.
+
+---
+Task ID: investigate-speed-and-websearch
+Agent: general-purpose
+Task: Investigate per-model speed differences and web search regression
+
+Work Log:
+- Read /home/z/my-project/worklog.md (1013 lines) — prior context: v1.4.1 introduced PromptRouter + buildSmartSystemPrompt + ContextCache; v1.4.2 narrowed triggers + removed broad attachment rule; v1.4.3 fixed Stop button + newline collapse. buildSystemPrompt (old, always-search) was REPLACED by buildSmartSystemPrompt (new, gated on router).
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/llm/LlmEngine.kt (954 lines) fully — identified SMALL_MODEL_THRESHOLD=0.7 (line 943), isSmallModel() at line 180-183 (DEAD CODE — not called anywhere), paramBasedCap (line 262-267), INPUT_CHAR_BUDGET=3000 (line 935, global), MAX_TOKENS=2048 (line 911), setMaxTopK(40) (line 338, global, NOT per-model), buildPrompt (line 871-893, IDENTICAL ChatML for all models), generateReplyStream (line 556-714, IDENTICAL streaming path for all models via engine.generateResponseAsync).
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/llm/ModelCatalog.kt (134 lines) — cataloged models: Qwen 0.5B (paramCountB=0.5, ≤0.7 ✓small), SmolLM 135M (0.135, ✓small), Qwen 1.5B (1.5, ✗ NOT small), Phi-4 Mini (3.8, ✗ NOT small, falls into >3.0 cap=1536), FastVLM 0.5B (0.5, ✓small but vision-only/litertlm).
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/ui/viewmodel/ChatViewModel.kt (1353 lines) — found the ONLY per-model branching at lines 711-718 (lengthNudge): ≤0.2 → "DEFAULT LENGTH: SHORT", ≤0.7 → "Be concise", else → "" (empty for 1.5B+). Web search flow traced: toggleInternet (line 156) → settings.setInternet → internetEnabled StateFlow (line 74). In buildSmartSystemPrompt (line 675-815): step 8 (line 763-785) gates web search on `internetEnabled.value && routed.matchedRules.any { it.id == "web_search" }`. Old buildSystemPrompt (line 817-981) is DEAD CODE — defined but never called; its always-search path at lines 955-971 no longer executes.
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/llm/PromptRouter.kt (278 lines) — web_search rule (line 166-179) has NARROWED triggers (line 161-165 comment: "Narrowed in v1.4.2: previously fired on 'what is', 'how to', 'who is' etc."). Current triggers list (line 169-176): "latest", "recent", "today", "yesterday", "this week", "news", "current events", "what's happening", "whats happening", "weather", "stock", "stock price", "score", "match result", "who won", "election", "update on", "price of", "now showing", "now playing", "box office", "just released", "just came out", "new release". Common factual questions like "what is the capital of France?" or "tell me about the new iPhone" do NOT match any trigger.
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/net/WebSearchService.kt (416 lines) — multi-source pipeline (Wikipedia REST → Wikipedia search → DuckDuckGo InstantAnswer → DuckDuckGo HTML → Bing HTML scrape). Returns multi-source text with snippets. NOTE: MAX_PER_RESULT_CHARS=3000 (line 412) is declared but NEVER USED — per-result snippet length is uncapped, could overflow INPUT_CHAR_BUDGET.
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/ui/components/MarkdownParser.kt (181 lines) — sanitize() has 4 passes (tag strip, \n→newline, \r removal, newline-run collapse). Applied ONLY to LLM OUTPUT (streaming chunks at ChatViewModel line 570 + final persist at line 598), NOT to web search results going INTO the prompt. Not the regression cause.
+- Read /home/z/my-project/handyai/app/src/main/java/com/handyai/llm/ContextCache.kt (175 lines) — web results cached per-query for 5 min (WEB_TTL_MS=300_000L, line 172), max 30 entries. Cache key is normalized (lowercase + whitespace-collapsed). Cache works fine; not the regression.
+- Verified SettingsRepository.kt line 47: internetEnabled defaults to false. Toggle flow works correctly via DataStore.
+- Cross-checked: searched all .kt files for isSmallModel/SMALL_MODEL_THRESHOLD/activeModelParamCount — only LlmEngine.kt defines them; ChatViewModel.kt:711 calls activeModelParamCount() directly (bypassing isSmallModel()).
+
+Stage Summary:
+
+═══════════════════════════════════════════════════════════════════════
+ISSUE 1: PER-MODEL SPEED ("Qwen 0.5B is fast — apply similar to other models")
+═══════════════════════════════════════════════════════════════════════
+
+ROOT CAUSE:
+Qwen 0.5B feels fast for THREE compounding reasons — only ONE of which (length nudge) is per-model and could be tuned. There is NO special "fast path" in the streaming code that other models are excluded from. Specifically:
+
+(A) Per-model length nudge (ChatViewModel.kt:711-718):
+    - ≤0.2B (SmolLM 135M)  → "DEFAULT LENGTH: SHORT. Reply in 1-3 sentences..." (line 713-714)
+    - ≤0.7B (Qwen 0.5B)    → "Be concise. Reply briefly unless the user asks for detail." (line 715-716)
+    - else (1.5B, 3.8B)    → "" (EMPTY — line 717)
+    
+    EFFECT: Qwen 0.5B gets a hard instruction to keep replies short → fewer tokens generated → faster perceived speed. Qwen 1.5B and Phi-4 get NO nudge → they ramble → longer generation → feel slower.
+
+(B) Per-model MAX_TOKENS cap (LlmEngine.kt:262-267):
+    - ≤0.7B   → 2048
+    - ≤1.5B   → 2048 (Qwen 1.5B — SAME as 0.5B, NOT throttled)
+    - ≤3.0B   → 2048 (no catalog model falls here — dead branch)
+    - >3.0B   → 1536 (Phi-4 — LOWER than smaller models)
+    
+    EFFECT: Phi-4 has the SMALLEST context window. Combined with a 3000-char INPUT_CHAR_BUDGET and no length nudge, Phi-4 has less output room → may truncate mid-reply.
+
+(C) Inherent model size: 0.5B has 3x fewer params than 1.5B and 7.6x fewer than 3.8B. Prefill + decode scale roughly linearly with param count. This is hardware/physics — can't be tuned in code.
+
+STREAMING IS IDENTICAL FOR ALL MODELS:
+- LlmEngine.generateReplyStream (line 556-714) uses the SAME engine.generateResponseAsync(prompt, listener) call for every model.
+- buildPrompt (line 871-893) emits IDENTICAL ChatML for every model.
+- No per-model topK/topP/temperature config — setMaxTopK(40) at line 338 is global on the engine options; session options at line 743-760 set NOTHING (comment explicitly says "We use the engine's defaults").
+- INPUT_CHAR_BUDGET=3000 (line 935) is GLOBAL — same for 0.135B SmolLM and 3.8B Phi-4.
+
+DEAD CODE / MISLEADING SIGNALS:
+- LlmEngine.isSmallModel() (line 180-183) and SMALL_MODEL_THRESHOLD=0.7 (line 943) are NEVER CALLED anywhere. They look like they should drive the small-model fast path but don't — ChatViewModel reads activeModelParamCount() directly at line 711 and uses its own inline thresholds (0.2 and 0.7).
+- ChatViewModel.buildSystemPrompt (line 817-981) is the OLD always-on-web-search path — DEFINED but NEVER CALLED. Only buildSmartSystemPrompt (line 675) is active. Confusing for future maintainers.
+- WebSearchService.MAX_PER_RESULT_CHARS=3000 (line 412) is declared but NEVER USED — per-snippet length is uncapped.
+
+RECOMMENDED FIXES (in priority order):
+
+1. **EXTEND length nudge to ALL models** (ChatViewModel.kt:712-718). The single highest-impact change. Replace the `else -> ""` branch with graduated nudges:
+   - ≤0.2B  → keep "DEFAULT LENGTH: SHORT. 1-3 sentences..." (current)
+   - ≤0.7B  → keep "Be concise..." (current)
+   - ≤1.5B  → "Be concise. Reply briefly unless the user asks for detail." (NEW — covers Qwen 1.5B)
+   - ≤3.0B  → "Reply concisely. Prefer 2-4 sentences for simple questions; expand only when asked." (NEW)
+   - >3.0B  → "Reply concisely. Aim for 2-4 sentences for simple questions." (NEW — covers Phi-4)
+   
+   This alone will make Qwen 1.5B and Phi-4 feel substantially faster because they'll stop generating sooner.
+
+2. **Per-model INPUT_CHAR_BUDGET** (LlmEngine.kt:935 + trimHistoryToBudget at line 817-837). Currently 3000 chars global. Prefill cost scales with seq_len² for attention — so a 3000-char prompt hurts 3.8B Phi-4 most. Suggest:
+   - ≤0.7B   → 3000 (current — small models handle it ok with minimal system prompt)
+   - ≤1.5B   → 2500
+   - ≤3.0B   → 2200
+   - >3.0B   → 1800 (Phi-4 — smaller prompt = faster first token)
+   
+   Pass the param count into trimHistoryToBudget (or make INPUT_CHAR_BUDGET a function of activeModelParamCount).
+
+3. **Per-model topK/temperature** (LlmEngine.kt:338). Currently `setMaxTopK(40)` is hard-coded. Add per-model tuning:
+   - SmolLM 135M: topK=20 (small model needs focused sampling — broad topK produces gibberish)
+   - Qwen 0.5B/1.5B: topK=40 (current — works)
+   - Phi-4: topK=30, temperature=0.7 (slightly more focused for higher quality + avoids repetition loops that slow generation)
+   
+   LlmInferenceOptions doesn't expose setTemperature/setTopP directly (only setMaxTopK), but LlmInferenceSessionOptions DOES (setTopK, setTopP, setTemperature — see comment at LlmEngine.kt:746-750). Since the session API is currently unused (v1.4.2 disabled it), this requires either re-enabling sessions or finding another path. LOWER PRIORITY than #1 and #2.
+
+4. **Raise >3B MAX_TOKENS cap on high-RAM devices** (LlmEngine.kt:266). Currently >3.0B → 1536 regardless of device RAM. The effectiveMaxTokens logic at line 269-290 already does RAM-based caps; relax the paramBasedCap for >3B when totalMem ≥ 6144 MB:
+   - >3.0B on ≥6GB RAM device → 2048 (matches smaller models)
+   - >3.0B on <6GB RAM device → 1536 (current — safe)
+   
+   This gives Phi-4 more output room on flagship phones without risking OOM on mid-range.
+
+5. **DELETE DEAD CODE** to reduce confusion:
+   - LlmEngine.isSmallModel() (line 180-183) and SMALL_MODEL_THRESHOLD (line 943) — unused.
+   - ChatViewModel.buildSystemPrompt (line 817-981) — unused, and contains the OLD always-search path that misleads readers about current web-search behavior.
+   - WebSearchService.MAX_PER_RESULT_CHARS (line 412) — unused; either wire it up (cap each snippet to 3000 chars) or delete.
+
+6. **CAP web search result length** (WebSearchService.kt:412). MAX_PER_RESULT_CHARS=3000 is declared but never enforced. Long Wikipedia extracts (5000+ chars) can blow past INPUT_CHAR_BUDGET and squeeze out history. Wire it up: in tryWikipedia (line 147-166) and tryWikipediaSearch (line 173-195), truncate each result to MAX_PER_RESULT_CHARS with a "[truncated]" marker.
+
+═══════════════════════════════════════════════════════════════════════
+ISSUE 2: WEB SEARCH REGRESSION ("LLMs can't fetch internet data — used to work, now unsatisfactory")
+═══════════════════════════════════════════════════════════════════════
+
+ROOT CAUSE (HIGH CONFIDENCE):
+The web search is GATED on the PromptRouter matching the `web_search` rule, and that rule's triggers were NARROWED in v1.4.2 to only "freshness" keywords. Most user questions no longer trigger any web search at all — even when the user has explicitly toggled internet ON.
+
+EXACT FLOW (with file:line):
+
+1. User toggles internet ON → ChatViewModel.toggleInternet(true) (line 156-159) → settings.setInternet(true) → SettingsRepository line 71-73 → DataStore write → internetEnabled StateFlow (line 74-75) becomes true. ✓ WORKS.
+
+2. User sends message → sendUserMessage(text) (line 292) → calls buildSmartSystemPrompt(...) (line 544-550).
+
+3. In buildSmartSystemPrompt (line 675-815):
+   a. Line 685-690: trivial greeting check → if matched, returns GREETING_PROMPT immediately. NO web search. (Expected for "hi"/"hello" — not the bug.)
+   b. Line 693: routedRaw = PromptRouter.route(userText) — scans userText for trigger substrings.
+   c. Line 697-701: if internetEnabled is OFF, filter OUT web_search rule from matchedRules. (Correct — don't search without internet.)
+   d. Line 711-718: per-model length nudge (see Issue 1).
+   e. Line 763-785 (STEP 8 — THE REGRESSION):
+      ```kotlin
+      val webCtx = if (internetEnabled.value &&
+          routed.matchedRules.any { it.id == "web_search" }) {
+          ...
+          val fresh = withContext(Dispatchers.IO) { webSearch.search(userText) }
+          ...
+      } else ""
+      ```
+      Web search runs ONLY IF:
+        (i)  internetEnabled.value is true, AND
+        (ii) routed.matchedRules contains a rule with id == "web_search"
+      
+      Condition (ii) is the regression. PromptRouter only adds web_search to matchedRules if userText contains one of these substrings (PromptRouter.kt:169-176):
+        "latest", "recent", "today", "yesterday", "this week",
+        "news", "current events", "what's happening", "whats happening",
+        "weather", "stock", "stock price", "score", "match result",
+        "who won", "election", "update on", "price of",
+        "now showing", "now playing", "box office",
+        "just released", "just came out", "new release"
+      
+      Common questions that DO NOT match any trigger (and thus NEVER trigger web search):
+        - "What is the capital of France?"
+        - "Tell me about the new iPhone"
+        - "Who is Albert Einstein?"
+        - "How does photosynthesis work?"
+        - "Explain quantum computing"
+        - "What's the population of Japan?"
+
+4. Web search results, WHEN they are fetched, ARE correctly injected into the system prompt at line 805-807:
+   ```kotlin
+   if (webCtx.isNotBlank()) {
+       sb.append("\n\nRecent web search results:\n").append(webCtx)
+   }
+   ```
+   The system prompt is then wrapped in `<|im_start|>system\n...\n<|im_end|>` by LlmEngine.buildPrompt (line 876-880). ChatML format is correct. The model DOES see the results when they're present. No formatting regression here.
+
+5. MarkdownParser.sanitize is NOT applied to web search results — only to LLM output (ChatViewModel.kt:570 and 598). So sanitize isn't eating search content.
+
+PRIOR BEHAVIOR (pre-v1.4.1):
+The OLD buildSystemPrompt function (ChatViewModel.kt:817-981, now DEAD CODE) ran web search whenever internetEnabled was true, with NO trigger gating:
+   ```kotlin
+   // line 955-971 (DEAD CODE — never called anymore):
+   if (internetEnabled.value) {
+       _statusText.value = "Searching the web…"
+       try {
+           val webCtx = withContext(Dispatchers.IO) { webSearch.search(userText) }
+           if (webCtx.isNotBlank()) { ... }
+       }
+   }
+   ```
+This is what "used to work fine earlier" — the user's mental model ("I turned on internet → searches happen") was correct.
+
+v1.4.1 replaced buildSystemPrompt with buildSmartSystemPrompt (smart routing). v1.4.2 then narrowed the web_search triggers (PromptRouter.kt:161-165 comment) to avoid bloating every reply's latency. The narrowing was well-intentioned (latency optimization) but broke the user's expectation: now most questions get NO web search even with internet ON.
+
+SECONDARY ISSUE:
+Even when web_search IS triggered, the web_search rule's PROMPT PARAGRAPH (PromptRouter.kt:177-178: "Web search results may be included below... Cite the source URL when relevant.") is only injected into the system prompt if the rule matched. So when internet is ON but no trigger matched (the regression case), even if we fixed step 8 to always search, the LLM wouldn't be told to cite sources. The fix below addresses both.
+
+TERTIARY ISSUE (not the regression, but worth noting):
+WebSearchService.MAX_PER_RESULT_CHARS=3000 (line 412) is declared but NEVER enforced. A long Wikipedia extract (5000+ chars) can inflate the system prompt past INPUT_CHAR_BUDGET=3000, causing trimHistoryToBudget (LlmEngine.kt:817-837) to drop all but the last 2 history turns. The user's latest message is always preserved (it's in the last 2), so this doesn't cause "lost question" — but it does cause "lost context" on multi-turn conversations with web search.
+
+RECOMMENDED FIX (single change, restores prior behavior):
+
+In ChatViewModel.kt:765-766, change the web search condition from:
+```kotlin
+val webCtx = if (internetEnabled.value &&
+    routed.matchedRules.any { it.id == "web_search" }) {
+```
+to:
+```kotlin
+val webCtx = if (internetEnabled.value) {
+```
+
+This restores the pre-v1.4.1 "always search when internet is on" behavior. The ContextCache (5-min per-query TTL, line 47 of ContextCache.kt) already prevents redundant network calls for repeat queries, so the latency cost is bounded.
+
+ALSO (to keep the "cite sources" instruction when internet is on):
+In ChatViewModel.kt:697-701, change the routed-filtering logic from:
+```kotlin
+val routed = if (!internetEnabled.value) {
+    routedRaw.copy(matchedRules = routedRaw.matchedRules.filter { it.id != "web_search" })
+} else {
+    routedRaw
+}
+```
+to (force-include web_search rule when internet is on, even if no triggers matched):
+```kotlin
+val routed = if (internetEnabled.value) {
+    if (routedRaw.matchedRules.none { it.id == "web_search" }) {
+        routedRaw.copy(matchedRules = routedRaw.matchedRules + PromptRouter.webSearchRule)
+    } else {
+        routedRaw
+    }
+} else {
+    routedRaw.copy(matchedRules = routedRaw.matchedRules.filter { it.id != "web_search" })
+}
+```
+This requires exposing the web_search Rule from PromptRouter (add `val webSearchRule = RULES.first { it.id == "web_search" }` as a public val).
+
+ALTERNATIVE (less invasive, keeps smart-routing philosophy):
+Broaden the web_search triggers in PromptRouter.kt:169-176 to include common factual question patterns:
+```kotlin
+triggers = listOf(
+    // freshness (current)
+    "latest", "recent", "today", "yesterday", "this week",
+    "news", "current events", "what's happening", "whats happening",
+    "weather", "stock", "stock price", "score", "match result",
+    "who won", "election", "update on", "price of",
+    "now showing", "now playing", "box office",
+    "just released", "just came out", "new release",
+    // factual (RESTORED from pre-v1.4.2)
+    "what is", "what's", "what are", "what was",
+    "who is", "who was", "who are",
+    "how to", "how do", "how does", "how did",
+    "tell me about", "explain", "define",
+    "when did", "when was", "when is",
+    "where is", "where are",
+    "why is", "why does", "why did",
+    "population of", "capital of", "history of",
+    "biography", "overview of"
+)
+```
+Risk: this re-introduces the latency bloat that v1.4.2 was trying to fix. The always-search fix (Option A above) is cleaner because the ContextCache already handles repeat-query latency.
+
+═══════════════════════════════════════════════════════════════════════
+CROSS-ISSUE NOTES
+═══════════════════════════════════════════════════════════════════════
+
+• Issue 1 and Issue 2 are INDEPENDENT. The speed complaint is about generation latency / reply length; the web search complaint is about a missing feature gate. They can be fixed in either order.
+
+• Both fixes are LOW RISK:
+  - Issue 1 fix #1 (extend length nudge) is a pure string change in a single when-branch.
+  - Issue 2 fix (drop the rule-match gate) is a 1-line condition change + optional 6-line refactor for the cite-sources instruction.
+
+• Neither fix requires changes to LlmEngine.kt's streaming code, ChatML formatting, or the WebSearchService pipeline. The regressions are in the PROMPT-BUILDING layer (ChatViewModel + PromptRouter), not in the engine or network layer.
+
+• TESTING: After applying Issue 2 fix, verify with these queries (internet ON):
+  - "What is the capital of France?" → should now fetch web results
+  - "Who is Albert Einstein?" → should now fetch web results
+  - "Tell me about the new iPhone" → should now fetch web results
+  - "hi" → should NOT fetch (trivial greeting fast path, line 685-690)
+  - "what's the weather today?" → should fetch (already worked, still works)
+  After applying Issue 1 fix #1, verify with Qwen 1.5B and Phi-4:
+  - Replies to simple questions should be visibly shorter (2-4 sentences vs paragraph+)
+  - First-token latency should feel similar (length nudge affects generation length, not prefill)
+
+• No code was modified in this investigation (research-only task). All file:line references are accurate as of the current source state (post-v1.4.3, main at 243da8a).
+
+═══════════════════════════════════════════════════════════════════════
+Task ID: investigate-markdown-and-tags
+Agent: general-purpose
+Task: Investigate re-enabling markdown bold + converting SmolLM XML tags to formatting
+═══════════════════════════════════════════════════════════════════════
+
+Work Log:
+- Read /home/z/my-project/worklog.md (prior context: v1.2.9 removed MarkdownParser.parse() due to IndexOutOfBoundsException in StreamingBubble caret positioning; v1.4.2 added tag-stripping pass for SmolLM; v1.4.3 added newline-collapse + per-chunk full-buffer re-sanitize).
+- Read MarkdownParser.kt (full file, 181 lines) — confirmed only `sanitize(text: String): String` remains; no `parse()` / AnnotatedString function. Class kdoc (lines 19-110) documents the v1.2.9 removal rationale and the 4 implemented passes (tag strip @ line 134, escape cleanup @ 142-149, CR removal @ 158, newline collapse @ 176).
+- Read MessageBubble.kt — found the non-streaming text render path: `MarkdownParser.sanitize(text)` at line 352, then `Text(text = block.content, ...)` at lines 368-372 for non-table blocks (plain String, NOT AnnotatedString). Long-press / Copy button at lines 332 and 453 copy the RAW `message.content` (not the parsed/sanitized text) — this is intentional so paste yields the original markdown markers.
+- Read MainScreen.kt StreamingBubble @ lines 1190-1309 — confirmed caret code is STILL PRESENT. The Text composable is at lines 1256-1261 (`text = sanitized` where `sanitized = MarkdownParser.sanitize(text)` at line 1255). The blinking orange caret is at lines 1286-1306, positioned via `lr.getCursorRect(lr.layoutInput.text.length)` at line 1288 — this is the SAFE variant (uses the layout's OWN text length, not the current parsed length).
+- Read ChatViewModel.kt streaming paths:
+  - Main chat path (line 570-572): `_streamingChunk.value = sanitize(_streamingChunk.value + chunk)` — re-sanitizes the FULL buffer per chunk. This means split tags (e.g. chunk1="<ans", chunk2="wer>Hel") are joined before sanitize runs, so partial tags are handled correctly.
+  - Vision path (line 1151): `_streamingChunk.value += sanitize(chunk)` — per-chunk sanitize (NOT full buffer). Split tags could leak through here, but vision model (FastVLM) doesn't emit SmolLM tags, so not a real bug today.
+  - Final persist (lines 598, 1161, 1239): `sanitize(full)` before `chatRepo.appendMessage`.
+- Read TtsSpeechSanitizer.kt (lines 80-90) — confirmed TTS path independently strips tags with the SAME regex (`<\/?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*?)?\/?>` at line 89). TTS must KEEP stripping (it shouldn't speak "less than thought greater than") — only the VISUAL path should convert tags to spans.
+- Read ModelCatalog.kt (lines 50-130) — confirmed SmolLM 135M is the only model likely emitting `<response>/<thought>/<answer>` tags (Qwen / Phi / FastVLM don't).
+- Searched codebase for explicit SmolLM tag examples — only the MarkdownParser kdoc (lines 65-71) and TtsSpeechSanitizer kdoc (lines 84-86) mention them, listing `<response>`, `<thought>`, `<answer>`. No prompt explicitly asks SmolLM to emit them — they're a learned artifact of the smol-smoltalk training set.
+- No files were modified (research-only task).
+
+──────────────────────────────────────────────────────────────────────
+Stage Summary
+──────────────────────────────────────────────────────────────────────
+
+ISSUE 1 — Re-enable `**bold**` and `### heading` rendering
+─────────────────────────────────────────────────────────
+
+Finding 1A — Caret code IS still in StreamingBubble (MainScreen.kt:1286-1306).
+  • The blinking orange caret at lines 1289-1305 is positioned using `lr.getCursorRect(lr.layoutInput.text.length)` (line 1288), where `lr` is the `TextLayoutResult` captured via `onTextLayout = { layoutResult = it }` at line 1260.
+  • This is the SAFE variant of the caret code. It uses `lr.layoutInput.text.length` — the length of the text the layout was ACTUALLY computed for — NOT the current `sanitized.length` or any `parsed.length`. `getCursorRect(layoutLength)` is always in-bounds (offset == length is the "after last char" position).
+  • The kdoc at MarkdownParser.kt:45-48 explicitly notes the previous "safe" fix used this same `lr.layoutInput.text.length` approach but the user still reported the crash after the 4th chat. The dev gave up and removed parsing entirely rather than chase the race further.
+
+Finding 1B — Re-enabling bold is SAFE given the current StreamingBubble implementation, PROVIDED the AnnotatedString (not the raw string) is what Text() receives.
+  • When Text() receives an AnnotatedString, `lr.layoutInput.text` IS that AnnotatedString (Compose types it as `AnnotatedString`). `lr.layoutInput.text.length` therefore equals the AnnotatedString's visible-text length (markers stripped). `getCursorRect(annotatedString.length)` is in-bounds for the layout computed from that same AnnotatedString.
+  • The ONE-FRAME LAG concern (kdoc MarkdownParser.kt:36-44): `lr` is the layout from the PREVIOUS frame's AnnotatedString; the current frame's AnnotatedString may be longer. The caret would then be positioned at the END of the PREVIOUS (shorter) AnnotatedString — i.e. it visually lags ~16ms behind the text growth. This is IMPERCEPTIBLE and NOT a crash. The crash described in the kdoc was when the OLD code used `parsed.length` (current, longer) on `lr` (previous, shorter layout) → out-of-bounds. The current code does NOT do that.
+  • Why the user may have still seen crashes with the safe variant: most likely a DIFFERENT root cause misattributed to the same symptom (e.g. a span range in the AnnotatedString pointing past the layout's text after a chunk boundary, or a NPE on `lr` before the first `onTextLayout` fired). The current `if (lr != null && lr.layoutInput.text.isNotEmpty())` guard at line 1287 already covers the NPE case.
+
+Finding 1C — Recommended approach (safest, lowest-risk):
+  Add a NEW function to MarkdownParser that returns AnnotatedString, and have BOTH MessageBubble and StreamingBubble call it. Do NOT touch the existing `sanitize(): String` (TTS, clipboard-copy, and DB-persist paths still need plain String).
+
+  ```kotlin
+  // In MarkdownParser.kt — NEW function alongside existing sanitize()
+  fun parseToAnnotatedString(text: String): AnnotatedString {
+      // 1. Run the existing sanitize() passes (tag strip, \n cleanup,
+      //    \r removal, newline collapse) to get the clean plain text.
+      val cleaned = sanitize(text)
+      // 2. Build AnnotatedString, stripping **..** and ### markers and
+      //    applying SpanStyle spans for bold / heading.
+      return AnnotatedString.Builder().apply {
+          // Walk cleaned line-by-line. For each line:
+          //   - If it matches ^###\s+(.*)$ → append the captured text
+          //     with SpanStyle(fontWeight = FontWeight.Bold, fontSize = 16.sp)
+          //   - Otherwise scan for **pairs** → append text between ** with
+          //     SpanStyle(fontWeight = FontWeight.Bold), append the rest plain.
+          //   - Handle unclosed ** at end of buffer gracefully: emit the
+          //     lone ** as literal text (so length stays in sync as more
+          //     chunks arrive and may close the pair on the next frame).
+          // CRITICAL: every character of `cleaned` must be appended to the
+          // builder (either plain or styled) — NO characters dropped. This
+      //    guarantees annotated.length == cleaned.length, which keeps the
+      //    StreamingBubble caret code (lr.layoutInput.text.length) valid
+      //    even though it's the layout's own length, not cleaned.length.
+      }.toAnnotatedString()
+  }
+  ```
+
+  Wire-up:
+  • MessageBubble.kt:368-372 — change `Text(text = block.content, ...)` to `Text(text = MarkdownParser.parseToAnnotatedString(block.content), ...)`. Keep `block.content` as the raw sanitized String for the clipboard-copy path (already does this at lines 332 / 453).
+  • MainScreen.kt:1256-1261 — change `text = sanitized` to `text = MarkdownParser.parseToAnnotatedString(sanitized)`. The caret code at line 1288 needs NO change — `lr.layoutInput.text.length` automatically becomes the AnnotatedString's length.
+
+  Belt-and-suspenders (optional): clamp the caret offset at line 1288:
+  `val safeLen = minOf(lr.layoutInput.text.length, lr.layoutInput.text.length)` (no-op today, but documents intent and protects against future regressions).
+
+  Alternative (MAXIMAL safety, slight UX change): replace the getCursorRect-based caret with a simple blinking "▍" character appended to the streaming text (can be the last span in the AnnotatedString itself, with its own color/alpha SpanStyle). This eliminates the TextLayoutResult dependency entirely. Tradeoff: the caret no longer "hugs" the last character on wrapped multi-line text — it sits at the end of the last line, which is the same place visually 95% of the time. RECOMMENDED ONLY IF re-enabling bold with the getCursorRect caret shows any recurrence of the crash in QA.
+
+Finding 1D — `### heading` parsing specifics:
+  • Match `^#{1,6}\s+(.+)$` per line (markdown ATX headings). The user explicitly asked for `###` but supporting 1-6 hashes is trivial and more useful.
+  • SpanStyle: `fontWeight = FontWeight.Bold`, optionally `fontSize = (base + 2)sp` for h1/h2, base size for h3-h6. Keep it simple: bold-only matches the user's literal ask ("### line gets converted to bold").
+  • Strip the `### ` prefix from the rendered text (so the user doesn't see the hashes), but the line itself stays the same length-minus-prefix. The caret-safe invariant (annotated.length == cleaned.length) is BROKEN here — heading lines are shorter in the AnnotatedString than in `cleaned`. This is OK because the caret code uses `lr.layoutInput.text.length` (the AnnotatedString's length, which the layout was computed from), NOT `cleaned.length`. The invariant that actually matters is: `annotated.length == lr.layoutInput.text.length`, which holds trivially because `lr` is computed FROM the annotated string.
+
+ISSUE 2 — Convert SmolLM XML tags to formatting instead of stripping
+────────────────────────────────────────────────────────────────────
+
+Finding 2A — Tags to recognize (best-known set; needs empirical verification):
+  The codebase only explicitly mentions three tags (MarkdownParser.kt:67-68: `<response>`, `<thought>`, `<answer>`). SmolLM-135M-Instruct was trained on smol-smoltalk which also uses `<reasoning>` in some samples. Recommended recognition table:
+
+  | Tag                    | Visual treatment                                  | Rationale                                              |
+  |------------------------|---------------------------------------------------|--------------------------------------------------------|
+  | `<response>…</response>` | Unwrap (strip tags, keep content plain)         | It's just a wrapper — no semantic meaning to the user |
+  | `<thought>…</thought>`   | Italic + dimmed color (onSurfaceVariant, 0.7α)  | Internal reasoning — show but de-emphasize            |
+  | `<reasoning>…</reasoning>` | Italic + dimmed (same as thought)             | Synonym for thought in smol-smoltalk                  |
+  | `<answer>…</answer>`     | Bold                                              | The actual answer — make it prominent                 |
+  | `<action>…</action>`     | Monospace + primary color                         | Tool-use action (rare on SmolLM 135M but defensive)   |
+  | `<summary>…</summary>`   | Bold                                              | Summary block — emphasize                             |
+  | Any other tag            | Strip (current behavior)                          | Unknown tags fall back to current strip-passthrough   |
+
+  IMPORTANT: this conversion is VISUAL-ONLY. The TTS path (TtsSpeechSanitizer.kt:89) must KEEP stripping ALL tags (it already does, with the same regex). TTS should not speak "less than thought greater than" nor "italic dimmed thought" — it should just speak the content. The two sanitizers diverge here: visual converts, TTS strips. This is the correct separation.
+
+  Also: the DB-persist path (ChatViewModel.kt:598, 1161, 1239) should KEEP storing the stripped/plain version (current behavior) so the saved message is searchable and paste-yields clean text. The tag-to-span conversion happens at RENDER time only (inside parseToAnnotatedString), not at sanitize time. This means `sanitize()` is unchanged — it still strips tags for storage/TTS/clipboard — and the new `parseToAnnotatedString()` does the tag-to-span conversion on top of the sanitized text. WAIT — this won't work: if sanitize() strips the tags BEFORE parseToAnnotatedString sees them, the parser has nothing to convert. So the implementation must REORDER: parseToAnnotatedString must run on the RAW text (before sanitize strips tags), do the tag conversion to spans, AND THEN run the other sanitize passes (escape cleanup, CR, newline collapse) on the non-tag text. See Finding 2C for the implementation structure.
+
+Finding 2B — Partial-tag handling during streaming:
+  • Current behavior (MarkdownParser.kt:133-135): the regex `<\/?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*?)?\/?>` only matches COMPLETE tags. An incomplete `<though` at the end of a chunk is left alone.
+  • Because ChatViewModel.kt:570-572 re-sanitizes the FULL buffer per chunk (`sanitize(buffer + chunk)`), split tags ARE handled correctly today: chunk1="<though" → buffer="<though" → no match → stays; chunk2="ht>thinking..." → buffer="<thought>thinking..." → match → stripped. The user briefly sees "<though" for ~50-200ms until the next chunk arrives — acceptable.
+  • For the new tag-CONVERSION logic, the same approach works: parseToAnnotatedString runs on the full buffer each frame, so split tags are joined before parsing. An incomplete `<though` at buffer-end is rendered as literal text "<though" for one frame, then converted to a span when the next chunk completes it. Acceptable tradeoff — same as today.
+  • EDGE CASE: a chunk that ends with `<` (just the open angle bracket, no tag name yet) — current regex leaves it alone, new parser should too. The parser must only attempt tag conversion when it sees `<` followed by a letter (or `/`).
+  • EDGE CASE: a chunk that ends mid-tag-name like `<th` — leave alone, next chunk completes it. The parser's regex must require at least one letter after `<` or `</`, AND require a closing `>` — otherwise leave the partial sequence as literal text.
+  • BUFFERING NOT NEEDED: because sanitize runs on the full buffer per chunk (ChatViewModel.kt:570-572), we do NOT need a separate incomplete-tag buffer. The buffer IS the incomplete-tag buffer. Just make sure parseToAnnotatedString also runs on the full buffer (it does — it's called from MessageBubble/StreamingBubble on the full text each frame).
+
+Finding 2C — Recommended implementation structure:
+  Add `parseToAnnotatedString(text: String): AnnotatedString` to MarkdownParser that does ALL of:
+  1. Escape cleanup (`\n` → newline, `\r` removal, `\t` → tab) — same as sanitize Pass 2-3.
+  2. Newline collapse (3+ → 2) — same as sanitize Pass 4.
+  3. Tag-to-span conversion: scan for `<tagname>...</tagname>` pairs (case-insensitive, allow attributes like `<thought lang="en">`). For known tags, push a SpanStyle for the content range; for unknown tags, strip. Incomplete `<` sequences at end-of-text are left as literal. CRITICAL: the tag markers themselves are NOT appended to the AnnotatedString builder (they're stripped, like `**` markers), so the visible text is shorter than the raw text — this is fine for the same reason as Issue 1 (caret uses `lr.layoutInput.text.length`).
+  4. `**bold**` parsing — as Issue 1.
+  5. `### heading` parsing — as Issue 1.
+  6. Return the AnnotatedString.
+
+  Then:
+  • MessageBubble.kt:368 — `Text(text = MarkdownParser.parseToAnnotatedString(block.content))` where `block.content` is the sanitized text from `MarkdownTable.splitBlocks(sanitized)`. NOTE: this means the table-splitter sees the sanitize-stripped text (tags already gone) — we'd LOSE the tag conversion for messages that go through table-splitting. To fix: have parseToAnnotatedString take the RAW `message.content` (not the sanitized version), and run all passes (including tag conversion) internally. MessageBubble.kt:352-358 would need to be restructured: instead of `sanitize → splitBlocks → parseToAnnotatedString`, do `parseToAnnotatedString(raw) → splitBlocks on the raw text → render each block as Text(parsedSpanForBlock)`. This is more invasive — recommend DEFERRING the table-block integration to a follow-up and shipping Issue 2 for non-table messages first.
+  • MainScreen.kt:1256 — `Text(text = MarkdownParser.parseToAnnotatedString(text))` (pass the raw streaming text, not the pre-sanitized version). The function runs all passes internally.
+
+  Streaming safety: parseToAnnotatedString is called on every recomposition of StreamingBubble (every chunk). It must be:
+  • O(n) in text length — fine for typical <2KB responses.
+  • Allocation-stable — AnnotatedString.Builder is the right tool (reuse not needed; GC handles short-lived builders).
+  • Idempotent — calling it on already-parsed text yields the same AnnotatedString (no double-conversion). This holds because the output has no `**`, no `###`, no `<tag>` sequences — they're all consumed on the first pass.
+
+Finding 2D — Open questions for the implementing agent:
+  • Empirical tag set: run SmolLM 135M in the app on a few prompts ("What is 2+2?", "Plan a trip to Paris", "Explain photosynthesis") and log the raw output BEFORE sanitize runs. Confirm which tags actually appear. The list in Finding 2A is best-effort from code comments + smol-smoltalk dataset knowledge.
+  • Should `<thought>` content be COLLAPSIBLE (a "show reasoning" toggle)? The user said "convert to bold or depending on which lim tag it is perform the action" — "perform the action" suggests different actions per tag, which could include collapsing. A clickable "💭 Thought" header that expands/collapses the thought content would be a clean UX. This is a PRODUCT decision — recommend shipping v1 with always-visible italic-dimmed, then adding collapse in a follow-up if the user wants it.
+  • Should the tag conversion apply to USER messages too? Currently user messages render verbatim (MessageBubble.kt:353 `canRenderTables = !isUser && !isError && !hasImage`). User messages don't contain SmolLM tags, so it doesn't matter — but the bold/heading parsing SHOULD apply to user messages too (if a user types `**emphasis**` they'd want to see it bold). Recommend: apply parseToAnnotatedString to user messages for `**`/`###` only (skip tag conversion since users don't emit tags).
+
+──────────────────────────────────────────────────────────────────────
+Key file:line references (current source, post-v1.4.3)
+──────────────────────────────────────────────────────────────────────
+  • MarkdownParser.kt:111-181        — `sanitize()` function (4 passes; only stripped-string output)
+  • MarkdownParser.kt:134            — tag-stripping regex (Issue 2 must replace/extend here)
+  • MarkdownParser.kt:19-110         — class kdoc explaining v1.2.9 bold-removal rationale
+  • MessageBubble.kt:317-381         — non-streaming text render path (plain Text, no AnnotatedString)
+  • MessageBubble.kt:352             — `val sanitized = MarkdownParser.sanitize(text)`
+  • MessageBubble.kt:368-372         — `Text(text = block.content, ...)` ← Issue 1 wire-up point
+  • MainScreen.kt:1190-1309          — StreamingBubble composable (full function)
+  • MainScreen.kt:1255-1261          — StreamingBubble Text() call ← Issue 1 wire-up point
+  • MainScreen.kt:1286-1306          — StreamingBubble caret code (STILL PRESENT, uses safe variant)
+  • MainScreen.kt:1288               — `lr.getCursorRect(lr.layoutInput.text.length)` ← safe; no change needed
+  • ChatViewModel.kt:570-572         — main streaming sanitize (full-buffer per chunk — handles split tags)
+  • ChatViewModel.kt:1151            — vision streaming sanitize (per-chunk — split tags could leak, low risk)
+  • ChatViewModel.kt:598, 1161, 1239 — final persist sanitize (DB stores stripped text — keep as-is)
+  • TtsSpeechSanitizer.kt:80-90      — TTS path strips tags independently (KEEP — TTS should not speak tag names)
+  • ModelCatalog.kt:63-71            — SmolLM 135M model spec (only model that emits these tags)
+
+──────────────────────────────────────────────────────────────────────
+Risk assessment
+──────────────────────────────────────────────────────────────────────
+  • Issue 1 (bold re-enable): LOW risk. The caret code is already the safe variant. The v1.2.9 crash was likely a different root cause misattributed. Recommend re-enabling with the getCursorRect caret AS-IS; if any crash recurs in QA, fall back to the blinking-character caret (Finding 1C alternative).
+  • Issue 2 (tag conversion): MEDIUM risk. New code path in the hot streaming loop. Main risks: (a) regex perf on every chunk (mitigated by O(n) regex, <2KB text), (b) span range bugs if the builder's append positions get misaligned with the source text offsets (mitigated by careful unit tests for the parser), (c) incomplete-tag flicker (acceptable, same as today). The table-block integration (Finding 2C) is the most invasive part — recommend deferring.
+  • Both issues touch the same function (parseToAnnotatedString) and should be implemented together in a single PR to avoid two separate hot-path modifications.
+
+──────────────────────────────────────────────────────────────────────
+Next actions (for the implementing agent)
+──────────────────────────────────────────────────────────────────────
+  1. Implement `MarkdownParser.parseToAnnotatedString(text: String): AnnotatedString` covering: escape cleanup, newline collapse, SmolLM tag-to-span conversion (Finding 2A table), `**bold**`, `### heading`.
+  2. Wire it into MessageBubble.kt:368 (non-table Text blocks) and MainScreen.kt:1256 (StreamingBubble Text).
+  3. Leave `sanitize(): String` UNCHANGED — still used by TTS, clipboard, DB-persist, and MarkdownTable.splitBlocks.
+  4. Leave the StreamingBubble caret code (MainScreen.kt:1286-1306) UNCHANGED — it's already safe.
+  5. Add unit tests for parseToAnnotatedString: empty input, plain text, `**bold**`, unclosed `**`, `### heading`, `<thought>...</thought>`, `<answer>...</answer>`, `<response>...</response>`, unknown tag, partial tag at end (`<though`), tag with attributes (`<thought lang="en">`), nested tags, mixed markdown + tags.
+  6. QA: run 5+ chats in a single session with SmolLM 135M to verify no recurrence of the v1.2.9 IndexOutOfBoundsException. If it recurs, switch to the blinking-character caret (Finding 1C alternative).
+  7. DEFER: table-block integration (Finding 2C), collapsible `<thought>` (Finding 2D), apply bold/heading parsing to user messages (Finding 2D).
+
+• No code was modified in this investigation (research-only task). All file:line references are accurate as of the current source state (post-v1.4.3, main at 243da8a).

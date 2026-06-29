@@ -16,6 +16,13 @@
  */
 package com.handyai.ui.components
 
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+
 /**
  * Sanitizes LLM output before rendering.
  *
@@ -178,4 +185,218 @@ object MarkdownParser {
 
         return result
     }
+
+    /**
+     * Sanitize WITHOUT tag stripping (v1.4.4).
+     *
+     * Runs passes 2-4 (escape cleanup, CR removal, newline collapse) but
+     * skips pass 1 (tag stripping). Used by [parseToAnnotatedString] which
+     * needs the tags preserved so it can convert them to formatting spans.
+     *
+     * Also used by MessageBubble for table-block splitting — tags don't
+     * interfere with `|`-delimited table detection, and keeping them lets
+     * the text blocks between tables get proper tag-to-formatting conversion.
+     */
+    internal fun sanitizeBasic(text: String): String {
+        if (text.isEmpty()) return text
+        var result = text
+        // Pass 2: literal \n, \r, \t
+        if (result.contains('\\')) {
+            result = result.replace("\\n", "\n")
+            result = result.replace("\\r", "")
+            result = result.replace("\\t", "\t")
+        }
+        // Pass 3: actual \r
+        if (result.contains('\r')) {
+            result = result.replace("\r\n", "\n").replace("\r", "")
+        }
+        // Pass 4: collapse 3+ newlines
+        if (result.length >= 3 && result.contains("\n")) {
+            result = result.replace(Regex("\n(?:[ \t]*\n){2,}"), "\n\n")
+        }
+        return result
+    }
+
+    /**
+     * Parse LLM output into an [AnnotatedString] with rich formatting (v1.4.4).
+     *
+     * This is the DISPLAY path — it converts:
+     *   - `**bold text**` → bold span
+     *   - `### heading` (at start of line) → bold span for the heading text
+     *   - `<thought>...</thought>` / `<reasoning>...</reasoning>` → italic + dimmed
+     *   - `<answer>...</answer>` / `<summary>...</summary>` → bold
+     *   - `<response>...</response>` → unwrapped (tags stripped, content kept)
+     *   - Other tags → stripped (content kept)
+     *
+     * SAFETY (v1.2.9 crash fix):
+     * The previous crash was caused by StreamingBubble's caret code using
+     * `parsed.length` on a stale TextLayoutResult. The current caret code
+     * uses `lr.layoutInput.text.length` (the layout's OWN text length),
+     * which is always in-bounds for that layout. Since `Text()` receives
+     * the AnnotatedString directly, `lr.layoutInput.text` IS the
+     * AnnotatedString, so lengths always match. Re-enabling bold parsing
+     * is now safe.
+     *
+     * PARTIAL TAGS during streaming:
+     * ChatViewModel re-sanitizes the FULL buffer per chunk, so a partial
+     * tag like `<though` at buffer-end renders as literal text for one
+     * frame (~50-200ms) then converts when the next chunk completes it.
+     *
+     * @param isUser If true, no formatting is applied (user messages
+     *               render verbatim — what you type is what you see).
+     */
+    fun parseToAnnotatedString(text: String, isUser: Boolean = false): AnnotatedString {
+        if (text.isEmpty()) return AnnotatedString("")
+
+        // For user/error messages: just clean escapes, no formatting
+        if (isUser) {
+            return AnnotatedString(sanitizeBasic(text))
+        }
+
+        // For assistant messages: clean escapes, then build AnnotatedString
+        val cleaned = sanitizeBasic(text)
+        if (cleaned.isEmpty()) return AnnotatedString("")
+
+        return buildAnnotatedString {
+            var i = 0
+            var plainStart = 0
+
+            // Flush accumulated plain text up to position [end]
+            fun flushPlain(end: Int) {
+                if (end > plainStart) {
+                    append(cleaned.substring(plainStart, end))
+                }
+            }
+
+            while (i < cleaned.length) {
+                // ── 1. SmolLM / XML-style tags ──────────────────────────
+                // Look for <tag>content</tag> pairs and convert to spans.
+                // Unknown tags are stripped (content kept). Incomplete tags
+                // (no closing >) are left as literal text — they'll resolve
+                // on the next chunk.
+                if (cleaned[i] == '<') {
+                    val tagResult = tryParseSmolLmTag(cleaned, i)
+                    if (tagResult != null) {
+                        flushPlain(i)
+                        val (tagName, content, nextI) = tagResult
+                        when (tagName) {
+                            "thought", "reasoning" -> {
+                                // Italic + dimmed gray for internal reasoning
+                                pushStyle(SpanStyle(
+                                    fontStyle = FontStyle.Italic,
+                                    color = Color(0xFF888888)
+                                ))
+                                append(content)
+                                pop()
+                            }
+                            "answer", "summary" -> {
+                                // Bold for the final answer
+                                pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+                                append(content)
+                                pop()
+                            }
+                            // response, action, and any other known tag:
+                            // strip the tag, keep content as plain text
+                            else -> append(content)
+                        }
+                        i = nextI
+                        plainStart = i
+                        continue
+                    }
+                }
+
+                // ── 2. Markdown headings: # through ###### at line start ─
+                // The user specifically asked for "### line gets converted
+                // to bold". We handle all heading levels (1-6) the same way:
+                // strip the #'s and make the line bold.
+                if (cleaned[i] == '#' && (i == 0 || cleaned[i - 1] == '\n')) {
+                    var j = i
+                    while (j < cleaned.length && cleaned[j] == '#') j++
+                    if (j < cleaned.length && cleaned[j] == ' ') {
+                        val lineEnd = cleaned.indexOf('\n', j + 1)
+                        val endIdx = if (lineEnd < 0) cleaned.length else lineEnd
+                        val headingText = cleaned.substring(j + 1, endIdx).trim()
+                        flushPlain(i)
+                        pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+                        append(headingText)
+                        pop()
+                        if (lineEnd >= 0) {
+                            append('\n')
+                            i = lineEnd + 1
+                        } else {
+                            i = cleaned.length
+                        }
+                        plainStart = i
+                        continue
+                    }
+                }
+
+                // ── 3. Bold: **text** ───────────────────────────────────
+                // Find a closing ** and make the inner text bold. If no
+                // closing ** is found (streaming partial), fall through to
+                // treat the ** as literal text.
+                if (cleaned[i] == '*' && i + 1 < cleaned.length && cleaned[i + 1] == '*') {
+                    val closeIdx = cleaned.indexOf("**", i + 2)
+                    if (closeIdx > i + 2) {
+                        val boldText = cleaned.substring(i + 2, closeIdx)
+                        flushPlain(i)
+                        pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+                        append(boldText)
+                        pop()
+                        i = closeIdx + 2
+                        plainStart = i
+                        continue
+                    }
+                }
+
+                i++
+            }
+            // Flush any remaining plain text
+            flushPlain(cleaned.length)
+        }
+    }
+
+    /**
+     * Try to parse a SmolLM-style tag at position [start] (which points to '<').
+     * Returns (tagName, innerContent, nextIndexAfterClosingTag) if a valid
+     * tag pair is found, or null if not.
+     *
+     * Only recognized tag names are matched — this prevents matching HTML
+     * tags like <b> or <strong> which shouldn't appear in LLM output but
+     * might appear in web search results.
+     */
+    private fun tryParseSmolLmTag(
+        text: String,
+        start: Int
+    ): Triple<String, String, Int>? {
+        // start points to '<'
+        val tagEnd = text.indexOf('>', start + 1)
+        if (tagEnd < 0) return null  // incomplete tag — partial streaming
+
+        val rawTag = text.substring(start + 1, tagEnd).trim()
+        // Tag name must be purely alphabetic (no attributes for simplicity)
+        if (rawTag.isEmpty() || !rawTag[0].isLetter()) return null
+
+        val tagName = rawTag.lowercase()
+        // Only recognize known SmolLM tag names
+        if (tagName !in SMOLLM_TAGS) return null
+
+        // Find closing tag: </tagName>
+        val closeTag = "</$tagName>"
+        val closeStart = text.indexOf(closeTag, tagEnd + 1, ignoreCase = true)
+        if (closeStart < 0) return null  // no closing tag — partial streaming
+
+        val content = text.substring(tagEnd + 1, closeStart)
+        val nextI = closeStart + closeTag.length
+        return Triple(tagName, content, nextI)
+    }
+
+    /**
+     * Set of recognized SmolLM tag names. Tags not in this set are left
+     * as literal text (or stripped by the fallback sanitize pass).
+     */
+    private val SMOLLM_TAGS = setOf(
+        "response", "thought", "reasoning", "answer", "summary", "action",
+        "think", "reflection", "plan", "output", "result"
+    )
 }

@@ -567,7 +567,14 @@ class ChatViewModel(
             // Fix: append the raw chunk, sanitize the WHOLE buffer, and
             // store the sanitized result. This is O(n) per chunk but n is
             // typically <2KB (a single response), so the cost is negligible.
-            _streamingChunk.value = com.handyai.ui.components.MarkdownParser.sanitize(
+            //
+            // ── v1.4.4: USE sanitizeBasic (NOT sanitize) ──────────────
+            // sanitize() strips SmolLM tags in Pass 1, but we want to KEEP
+            // them in the streaming buffer so parseToAnnotatedString can
+            // convert them to formatting spans (bold, italic, etc.) in the
+            // StreamingBubble. The DB persist path uses sanitize() to strip
+            // tags before storage.
+            _streamingChunk.value = com.handyai.ui.components.MarkdownParser.sanitizeBasic(
                 _streamingChunk.value + chunk
             )
         }
@@ -603,7 +610,12 @@ class ChatViewModel(
                     }
                 }.onFailure { err ->
                     if (isCancellation && partial.isNotBlank()) {
-                        chatRepo.appendMessage(chatId, Role.ASSISTANT, partial.trimEnd())
+                        // ── v1.4.4: strip tags for DB storage ──────────────
+                        // partial is sanitizeBasic output (tags preserved for
+                        // display). For DB storage, run full sanitize() to
+                        // strip SmolLM tags so they don't clutter stored text.
+                        val dbText = com.handyai.ui.components.MarkdownParser.sanitize(partial).trimEnd()
+                        chatRepo.appendMessage(chatId, Role.ASSISTANT, dbText)
                         android.util.Log.i("HandyAi/ChatVM",
                             "Generation stopped by user, persisted partial: ${partial.length} chars")
                     } else {
@@ -703,18 +715,29 @@ class ChatViewModel(
         // ── 3. PREFERENCE LEARNER HINT ─────────────────────────────────
         val prefHint = try { preferenceLearner.buildHint() } catch (_: Throwable) { "" }
 
-        // ── 4. PER-MODEL LENGTH CONSTRAINTS ────────────────────────────
+        // ── 4. PER-MODEL LENGTH CONSTRAINTS (v1.4.4) ──────────────────
         // SmolLM 135M is too chatty by default — user explicitly asked
         // for short/medium/precise replies unless asked for detail.
-        // Other small models (Qwen 0.5B) get a soft "be concise" nudge.
-        // Larger models (1.5B+) get no length instruction (let them decide).
+        // Qwen 0.5B / 1.5B get a soft "be concise" nudge.
+        // Phi-4-mini (3.8B) and larger get a medium-length nudge so they
+        // don't ramble — the user reported Qwen 0.5B is fast/snappy and
+        // wants the other models to feel similar.
+        //
+        // Previously the `else` branch returned "" (no nudge), which let
+        // 1.5B+ models generate long rambling replies. Now every model
+        // gets a graduated nudge calibrated to its capability.
         val paramCount = llm.activeModelParamCount() ?: 0.0
         val lengthNudge = when {
             paramCount <= 0.2 ->  // SmolLM 135M and smaller
                 "DEFAULT LENGTH: SHORT. Reply in 1-3 sentences unless the user explicitly asks for detail, code, lists, or step-by-step explanations. Be precise — no filler, no preamble."
             paramCount <= 0.7 ->  // Qwen 0.5B
                 "Be concise. Reply briefly unless the user asks for detail."
-            else -> ""  // Qwen 1.5B+, Phi-4 — let them decide
+            paramCount <= 1.5 ->  // Qwen 1.5B
+                "Be concise and direct. Reply in 1-5 sentences unless the user asks for detail. Avoid restating the question."
+            paramCount <= 4.0 ->  // Phi-4-mini (3.8B)
+                "Be concise. Give a direct answer in 1-6 sentences unless detail is requested. Use lists only when asked."
+            else ->  // Larger models
+                "Be concise. Prefer a direct answer over restating context."
         }
 
         // ── 5. RELEVANT CORRECTIONS ───────────────────────────────────
@@ -760,10 +783,17 @@ class ChatViewModel(
             }.trim()
         } else ""
 
-        // ── 8. WEB SEARCH (only if internet enabled + relevant) ───────
-        // Use the ContextCache to dedupe recent web queries.
-        val webCtx = if (internetEnabled.value &&
-            routed.matchedRules.any { it.id == "web_search" }) {
+        // ── 8. WEB SEARCH (v1.4.4: run whenever internet is ON) ───────
+        // Previously this was gated on `routed.matchedRules.any { it.id == "web_search" }`,
+        // which only fired for freshness keywords ("latest", "news", "weather").
+        // Common factual questions matched no rule → no web search ran,
+        // even with internet ON. The user reported "LLMs are not able to
+        // fetch data from internet properly — it used to work fine earlier."
+        //
+        // Fix: run web search whenever internet is enabled, regardless of
+        // the PromptRouter's classification. ContextCache dedupes recent
+        // queries (5-min TTL) so this doesn't spam the network.
+        val webCtx = if (internetEnabled.value) {
             _statusText.value = "Searching the web…"
             try {
                 val cached = contextCache.getWebResult(userText)
