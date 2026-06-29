@@ -139,9 +139,13 @@ class FileTextExtractor(
         // Documents (PDF/DOCX/etc.) skip this path entirely — on-device
         // extraction is already excellent for them.
         var method = "unknown"
-        var text: String
-        var label: String
-        var truncated: Boolean
+        // Initialize to defaults so Kotlin's definite-assignment analysis
+        // is satisfied — the image branch has nested if/else where the
+        // compiler can't prove every path assigns all three. The defaults
+        // are overwritten in every real code path below.
+        var text: String = ""
+        var label: String = ""
+        var truncated: Boolean = false
 
         if (isImage(displayName, mime)) {
             // ── CLOUD VISION (online) ─────────────────────────────────
