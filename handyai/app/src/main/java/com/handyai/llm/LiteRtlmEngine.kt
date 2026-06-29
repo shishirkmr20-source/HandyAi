@@ -23,6 +23,7 @@ import android.net.Uri
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
@@ -31,6 +32,7 @@ import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -61,9 +63,6 @@ import java.io.File
  *   - [LlmEngine]       → MediaPipe  → `.task` files    → text-only
  *   - [LiteRtlmEngine]  → LiteRT-LM  → `.litertlm`      → text + vision
  *
- * The ChatViewModel dispatches to whichever engine matches the active
- * model's file extension.
- *
  * NATIVE VISION (no OCR/labels needed)
  * ────────────────────────────────────
  * When FastVLM is active, image attachments are passed DIRECTLY to the
@@ -79,32 +78,16 @@ import java.io.File
  * the prefill cost for the NEW tokens — not the whole history. This
  * is the same trick PocketPal AI uses.
  *
- * On system-prompt change or generation failure, we recreate the
- * conversation to discard any partial KV cache state.
- *
  * SYNC API (v1.4.0 limitation)
  * ────────────────────────────
- * LiteRT-LM alpha05 has `sendMessageAsync` but its callback completion
- * semantics are unclear (no explicit "done" signal — only onMessage +
- * onError). For reliability, we use the SYNC `sendMessage(message)`
+ * LiteRT-LM alpha05 has an async `sendMessageAsync` Flow API and a
+ * callback variant. For reliability we use the SYNC `sendMessage(message)`
  * API which blocks until the full response is ready, then returns the
- * complete Message.
+ * complete Message. The user sees a "Vision model analyzing image…"
+ * status during generation, then the reply appears word-by-word via
+ * a brief fake-typing effect on the final text.
  *
- * The downside: no token-by-token streaming. The user sees a brief
- * "Generating…" status while the model thinks, then the full reply
- * appears. For vision models (which take 2-10s anyway), this is
- * acceptable. We add a small "fake typing" effect by emitting the
- * response word-by-word via onChunk after the sync call returns.
- *
- * LIMITATIONS
- * ───────────
- *   - LiteRT-LM is alpha-quality (0.0.0-alpha05). Native crashes are
- *     possible on malformed input. We catch all throwables and surface
- *     them as Result.failure.
- *   - 60-second hard timeout per generation. If the model hangs, we
- *     abort and return an error.
- *   - No streaming — full reply appears at once after generation.
- *     (We fake a typing effect by word-emitting the final text.)
+ * 60-second hard timeout — if the model hangs, we abort.
  */
 class LiteRtlmEngine(private val context: Context) {
 
@@ -122,12 +105,9 @@ class LiteRtlmEngine(private val context: Context) {
         activeModelPath?.let { File(it).nameWithoutExtension }
 
     /**
-     * Load a `.litertlm` model file.
-     *
-     * Attempts GPU backend first (for the vision encoder — GPU is much
-     * faster for image processing), falls back to CPU if GPU fails.
-     * Creates a fresh conversation with the given system prompt (or a
-     * sensible default).
+     * Load a `.litertlm` model file. Attempts GPU vision backend first
+     * (much faster for image processing), falls back to CPU if GPU fails.
+     * Creates a fresh conversation with the given system prompt baked in.
      */
     suspend fun setActiveModel(
         path: String,
@@ -176,7 +156,6 @@ class LiteRtlmEngine(private val context: Context) {
             activeModelPath = path
             currentSystemPrompt = sp
 
-            // Create the conversation with the system prompt baked in.
             conversation = createConversation(eng, sp)
             Log.i(TAG, "LiteRT-LM model loaded successfully: ${file.name}")
             _state.value = LlmState.Ready
@@ -217,26 +196,29 @@ class LiteRtlmEngine(private val context: Context) {
     }
 
     private fun createEngine(path: String, preferGpu: Boolean): Engine {
+        // Backend.CPU() and Backend.GPU() — both are classes that need
+        // instantiation. CPU is a data class (threadCount, numOfThreads
+        // optional params); GPU is a regular class with no params.
         val config = EngineConfig(
             modelPath = path,
-            backend = Backend.CPU,
-            visionBackend = if (preferGpu) Backend.GPU else Backend.CPU,
-            audioBackend = Backend.CPU,
+            backend = Backend.CPU(),
+            visionBackend = if (preferGpu) Backend.GPU() else Backend.CPU(),
+            audioBackend = Backend.CPU(),
             maxNumTokens = 2048
         )
         return Engine(config)
     }
 
     private fun createConversation(eng: Engine, systemPrompt: String): Conversation {
-        val systemMessage = Message.of(systemPrompt)
+        // ConversationConfig.systemInstruction takes a Contents? (not a Message).
+        // Contents.of(text) wraps a single Content.Text.
         val convConfig = ConversationConfig(
-            systemMessage = systemMessage,
-            tools = emptyList(),
+            systemInstruction = Contents.of(systemPrompt),
             samplerConfig = SamplerConfig(
-                /* topK = */ 40,
-                /* topP = */ 0.95,
-                /* temperature = */ 0.8,
-                /* seed = */ 0
+                topK = 40,
+                topP = 0.95,
+                temperature = 0.8,
+                seed = 0
             )
         )
         return eng.createConversation(convConfig)
@@ -245,8 +227,6 @@ class LiteRtlmEngine(private val context: Context) {
     /**
      * Update the system prompt. Recreates the conversation (and discards
      * the KV cache) if the new prompt differs from the current one.
-     *
-     * Cheap to call when the prompt hasn't changed — short-circuits.
      */
     fun updateSystemPrompt(newPrompt: String?) {
         val sp = newPrompt?.takeIf { it.isNotBlank() } ?: DEFAULT_SYSTEM_PROMPT
@@ -287,11 +267,9 @@ class LiteRtlmEngine(private val context: Context) {
      * the text. The model's vision encoder reads the pixels directly —
      * no OCR, no labels, no hallucination.
      *
-     * Internally uses the SYNC `sendMessage` API (alpha05 limitation —
-     * see class kdoc). We fake the typing effect by word-emitting the
-     * final response via [onChunk] after the sync call returns.
-     *
-     * 60-second hard timeout — if the model hangs, we abort.
+     * Internally uses the SYNC `sendMessage` API with a 60s timeout.
+     * After the sync call returns, the full response is emitted word-by-
+     * word via [onChunk] to give a typing effect.
      */
     suspend fun generateReplyStream(
         userText: String,
@@ -306,6 +284,7 @@ class LiteRtlmEngine(private val context: Context) {
         _state.value = LlmState.Generating
         try {
             // Build the message: optional image + required text.
+            // Use Message.user(Contents.of(...)) — the explicit factory.
             val contents = mutableListOf<Content>()
             if (imageUri != null) {
                 val imageBytes = loadAndDownscaleImage(imageUri, maxDim = 1024)
@@ -317,10 +296,10 @@ class LiteRtlmEngine(private val context: Context) {
                 }
             }
             contents.add(Content.Text(userText))
-            // Message.of(List<Content>) — overload that takes a List.
-            val message = Message.of(contents)
+            val message = Message.user(Contents.of(contents))
 
-            // Sync call with 60s timeout.
+            // Sync call with 60s timeout. sendMessage blocks until the
+            // model finishes generating, then returns the complete Message.
             val response: Message? = withTimeoutOrNull(60_000L) {
                 conv.sendMessage(message)
             }
@@ -332,39 +311,19 @@ class LiteRtlmEngine(private val context: Context) {
             val fullText = messageToText(response)
             Log.i(TAG, "Generation complete: ${fullText.length} chars")
 
-            // Fake typing effect: emit the response word-by-word with a
+            // Fake typing effect — emit the response word-by-word with a
             // small delay so the UI feels responsive. The actual generation
-            // happened synchronously above — this is just presentation.
+            // happened synchronously above; this is just presentation.
             //
-            // 12ms per word ≈ 80 words/sec — fast enough to not annoy the
-            // user but visible enough to feel "alive".
-            val words = fullText.split(" ", "\n")
-            val sb = StringBuilder()
-            for ((idx, word) in words.withIndex()) {
-                if (idx == 0) {
-                    sb.append(word)
-                } else {
-                    // Preserve newlines from the split
-                    val sep = if (fullText.regionMatches(
-                            startIndex = sb.length,
-                            other = "\n",
-                            otherStart = 0,
-                            length = 1
-                        )
-                    ) "\n" else " "
-                    sb.append(sep).append(word)
-                }
-                // Emit the new word (with separator) as a chunk.
-                val chunk = if (idx == 0) word else {
-                    val sep2 = if (fullText.regionMatches(
-                            sb.length - word.length - 1,
-                            "\n", 0, 1
-                        )
-                    ) "\n$word" else " $word"
-                    sep2
-                }
-                onChunk(chunk)
-                kotlinx.coroutines.delay(8L)
+            // Split on whitespace but preserve it in the chunks we emit
+            // so the bubble renders newlines + indentation correctly.
+            val tokens = fullText.split("(?<=\\s)".toRegex())
+            for (tok in tokens) {
+                if (tok.isEmpty()) continue
+                onChunk(tok)
+                // 8ms per token ≈ 120 tokens/sec — fast enough to not
+                // annoy but visible enough to feel "alive".
+                delay(8L)
             }
 
             _state.value = LlmState.Ready
@@ -383,14 +342,16 @@ class LiteRtlmEngine(private val context: Context) {
     /**
      * Convert a LiteRT-LM Message back to a plain string.
      *
-     * A Message is a list of Content parts; we concatenate all Text parts
-     * (vision models sometimes return image+text interleaved, but we only
-     * care about the text for chat display).
+     * `message.contents` is a `Contents` object; `Contents.contents` is
+     * the underlying `List<Content>`. We concatenate all `Content.Text`
+     * parts (vision models sometimes return image+text interleaved, but
+     * we only care about the text for chat display).
      */
     private fun messageToText(message: Message): String {
         return try {
-            val contents = message.contents
-            contents.filterIsInstance<Content.Text>().joinToString("") { it.text }
+            message.contents.contents
+                .filterIsInstance<Content.Text>()
+                .joinToString("") { it.text }
         } catch (t: Throwable) {
             Log.w(TAG, "messageToText failed", t)
             ""
@@ -400,9 +361,6 @@ class LiteRtlmEngine(private val context: Context) {
     /**
      * Load an image from [uri], downscale so the longest edge is at most
      * [maxDim] pixels, and JPEG-encode to a byte array.
-     *
-     * Returns null if the bitmap can't be decoded (corrupted file, missing
-     * permission, etc.). The caller should fall back to text-only.
      */
     private fun loadAndDownscaleImage(uri: Uri, maxDim: Int): ByteArray? {
         return try {
