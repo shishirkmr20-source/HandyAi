@@ -375,3 +375,23 @@ Stage Summary:
   2. User can freely scroll up to read chat history while the LLM is streaming a reply (auto-scroll no longer fights manual scroll).
 - Bonus: added a "scroll to bottom" FAB (bottom-right chevron) that appears when scrolled up, matching WhatsApp/Telegram UX.
 - No layout structure changes — the Scaffold/Box/Column/LazyColumn hierarchy is unchanged. The fix is entirely in scroll-position management.
+
+---
+Task ID: push-and-build-v1.4.2
+Agent: main
+Task: Push commits to GitHub and build v1.4.2 APK for the chat scroll fix.
+
+Work Log:
+- Installed Android SDK (cmdline-tools, platform-tools, platforms;android-35, build-tools;35.0.0) at /home/z/android-sdk.
+- Downloaded and extracted portable Temurin JDK 21 to /home/z/jdk (system had only JRE, no javac).
+- Wrote /home/z/my-project/handyai/local.properties pointing to sdk.dir.
+- Built release APK: `./gradlew :app:assembleRelease --no-daemon` — BUILD SUCCESSFUL in 1m 20s.
+- Copied 127 MB APK to /home/z/my-project/download/handyai-v1.4.2-apk/app-release.apk.
+- Pushed 12 commits to origin/main using a user-provided PAT (URL-embedded, one-shot, credential.helper disabled). Initial push disconnected mid-way (large pack); retry completed successfully. Final origin/main = c473cf8.
+- Cleaned up: removed /tmp push logs and downloaded archives; verified no credential helper stores the token.
+
+Stage Summary:
+- GitHub: 12 commits pushed to https://github.com/shishirkmr20-source/HandyAi.git (main now at c473cf8).
+- APK: v1.4.2 (versionCode 35) ready at /home/z/my-project/download/handyai-v1.4.2-apk/app-release.apk (127 MB).
+- Includes: chat scroll fix (last line above input box, free scroll-up during streaming, scroll-to-bottom FAB) plus all prior v1.4.2 fixes (TTS table handling, image OCR budget, etc.).
+- Security note: PAT was used inline only; user should revoke it since it was shared in chat.
